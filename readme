@@ -1,0 +1,47 @@
+#setup打包环境：
+打包项目需先安装 setuptool 和 wheel：
+在cmd命令行中
+python -m pip install setuptools wheel
+
+#打包发布
+切换到项目的 setup.py文件所在目录然后执行：
+python setup.py sdist bdist_wheel
+打包后项目根目录下生成dist目录，里面包含 whl和tar.gz,whl是安装文件，tar.gz是源文件
+
+#安装
+本地安装whl文件：
+在cmd命令行中：切换到whl文件所在目录
+pip install XXX.whl
+
+#使用
+使用：创建py文件，在其中导入需要的模块即可 eg：
+from com.rtcce.laser.util.LOGUtil import LOGUtil
+logger = LOGUtil.getLogger(__main__)
+
+备注：项目中的每个py文件都是一个模块
+
+#卸载：
+cmd命令行中执行
+pip uninstall PTZController
+
+
+#exe打包
+pyinstaller 打包exe
+准备：
+cmd命令行下执行:
+pip install pyinstaller
+
+cmd命令行下执行:
+pyinstaller XXX.py
+生成:XXX.spec文件
+修改XXX.spec文件：
+Analysis参数元组第一个是项目中所有的py文件路径
+Analysis参数元组第二个pathex为可执行py路径
+
+然后再次执行
+pyinstaller -F XXX.py
+
+
+
+
+
