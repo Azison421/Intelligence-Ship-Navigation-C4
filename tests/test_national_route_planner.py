@@ -28,6 +28,7 @@ from usvlib4ros.planning.fixed_route import (
     fixed_route_goal_xy,
     fixed_route_planning_gate,
     fixed_route_tolerance,
+    fixed_route_waypoint_reached,
     plan_fixed_leg,
     plan_fixed_route,
 )
@@ -113,11 +114,41 @@ def test_fixed_route_preserves_published_yellow_waypoint_coordinates():
             stamp_sim=snapshot.stamp_sim,
         )
         assert snapshot.is_state_valid(gate_state)
-        assert snapshot.clearance_at(gate_state) >= 0.7
-        assert (
-            math.hypot(gate[0] - expected[0], gate[1] - expected[1])
-            <= fixed_route_tolerance(compiled, mission_index)
-        )
+        assert snapshot.clearance_at(gate_state) >= 0.3
+        assert math.hypot(
+            gate[0] - expected[0],
+            gate[1] - expected[1],
+        ) <= 0.5
+        assert fixed_route_tolerance(compiled, mission_index) == 0.5
+
+
+def test_waypoint_reach_requires_ship_centre_within_point_five_metres():
+    compiled = compile_offline_national_map(
+        session_id="national-route-reach-boundary",
+    )
+    goal_x, goal_y = fixed_route_goal_xy(compiled.manifest, 0)
+    on_boundary = VesselState(
+        x=goal_x + 0.5,
+        y=goal_y,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=compiled.snapshot.stamp_sim,
+    )
+
+    assert fixed_route_waypoint_reached(compiled, 0, on_boundary)
+    assert not fixed_route_waypoint_reached(
+        compiled,
+        0,
+        VesselState(
+            x=goal_x + 0.5001,
+            y=goal_y,
+            yaw=0.0,
+            speed=0.0,
+            yaw_rate=0.0,
+            stamp_sim=compiled.snapshot.stamp_sim,
+        ),
+    )
 
 
 def test_planner_solves_first_buoy_gate_with_kinodynamic_seed():

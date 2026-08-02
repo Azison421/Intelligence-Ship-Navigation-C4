@@ -24,7 +24,8 @@ from usvlib4ros.planning import (
 from usvlib4ros.planning.fixed_route import (
     ROUTE_GUIDANCE_VERSION,
     compile_offline_national_map,
-    fixed_route_gate_region,
+    fixed_route_goal_xy,
+    fixed_route_tolerance,
     plan_fixed_leg,
 )
 
@@ -171,14 +172,17 @@ class FixedMapSACTrainer:
         )
 
     def _goal(self, mission_index: int) -> GoalRegion:
-        goal_x, goal_y, tolerance = fixed_route_gate_region(
-            self.compiled_map,
+        goal_x, goal_y = fixed_route_goal_xy(
+            self.compiled_map.manifest,
             mission_index,
         )
         return GoalRegion(
             x=goal_x,
             y=goal_y,
-            position_tolerance=tolerance,
+            position_tolerance=fixed_route_tolerance(
+                self.compiled_map,
+                mission_index,
+            ),
             speed_limit=1.2,
             yaw_rate_limit=1.2,
         )

@@ -1,6 +1,7 @@
 """Pure-Python planning modules with no ROS, Unity, or MATLAB dependency."""
 
 from .kinodynamic_informed_rrtstar import (
+    CircularObstacle,
     Control,
     CostConfig,
     GoalRegion,
@@ -21,6 +22,7 @@ from .kinodynamic_informed_rrtstar import (
     VesselState,
 )
 __all__ = [
+    "CircularObstacle",
     "Control",
     "CostConfig",
     "GoalRegion",

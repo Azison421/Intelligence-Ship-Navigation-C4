@@ -10,6 +10,7 @@ from time import perf_counter
 import pytest
 
 from usvlib4ros.planning import (
+    CircularObstacle,
     Control,
     CostConfig,
     GoalRegion,
@@ -46,6 +47,47 @@ def _world(rows: tuple[str, ...] | None = None) -> PlanningMapSnapshot:
         footprint_radius=0.15,
         stamp_sim=10.0,
     )
+
+
+def test_circular_obstacle_uses_exact_surface_clearance():
+    world = PlanningMapSnapshot.from_rows(
+        ("..........",) * 10,
+        snapshot_id="circle-map",
+        session_id="circle-session",
+        source_version=1,
+        resolution=1.0,
+        footprint_radius=0.4,
+        required_clearance=0.2,
+        circular_obstacles=(CircularObstacle(x=5.0, y=5.0, radius=1.0),),
+    )
+    safe = VesselState(
+        x=7.0,
+        y=5.0,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
+    )
+
+    assert world.clearance_at(safe) == pytest.approx(0.6)
+    assert world.is_state_valid(safe)
+    assert not world.is_state_valid(replace(safe, x=6.5))
+
+
+def test_circular_obstacles_are_bound_into_payload_hash():
+    kwargs = {
+        "snapshot_id": "circle-hash-map",
+        "session_id": "circle-hash-session",
+        "source_version": 1,
+    }
+    empty = PlanningMapSnapshot.from_rows(("....",) * 4, **kwargs)
+    occupied = PlanningMapSnapshot.from_rows(
+        ("....",) * 4,
+        circular_obstacles=(CircularObstacle(x=2.0, y=2.0, radius=0.5),),
+        **kwargs,
+    )
+
+    assert occupied.payload_content_hash != empty.payload_content_hash
 
 
 def _request(dynamics: PrototypeReducedDynamics) -> PlanningRequest:

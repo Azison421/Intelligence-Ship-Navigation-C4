@@ -27,7 +27,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from usvlib4ros.planning import PlanningMapSnapshot
+from usvlib4ros.planning import CircularObstacle, PlanningMapSnapshot
 
 from .coordinates import (
     AffineTransform2D,
@@ -38,8 +38,8 @@ from .coordinates import (
 )
 
 SIDECAR_SCHEMA_VERSION = "build-bound-static-world-sidecar-v1"
-COMPILER_VERSION = "beihu-sidecar-compiler-v1"
-DEFAULT_RESOLUTION_M = 0.5
+COMPILER_VERSION = "beihu-sidecar-compiler-v2"
+DEFAULT_RESOLUTION_M = 0.2
 DEFAULT_MARGIN_M = 5.0
 DEFAULT_FOOTPRINT_RADIUS_M = 0.4
 DEFAULT_REQUIRED_CLEARANCE_M = 0.2
@@ -297,9 +297,7 @@ def compile_beihu_sidecar(
     for gy in range(height):
         row_chars = []
         for gx in range(width):
-            if occupied[gy, gx]:
-                row_chars.append("#")
-            elif water[gy, gx]:
+            if water[gy, gx]:
                 row_chars.append(".")
             else:
                 row_chars.append("?")
@@ -319,7 +317,16 @@ def compile_beihu_sidecar(
         stamp_sim=stamp_sim,
         source_artifact_hash=source_artifact_hash,
         compiler_config_hash=config.config_hash(),
+        circular_obstacles=tuple(
+            CircularObstacle(
+                x=buoy.x - origin[0],
+                y=buoy.y - origin[1],
+                radius=buoy.radius_m,
+            )
+            for buoy in buoys
+        ),
     )
+    snapshot.precompute_clearance()
     manifest = SidecarMapManifest(
         snapshot_id=resolved_snapshot_id,
         origin_enu=origin,

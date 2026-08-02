@@ -240,6 +240,19 @@ class MotionCheck:
 
 
 @dataclass(frozen=True)
+class CircularObstacle:
+    """Exact fixed circular obstacle in the planning-map frame."""
+
+    x: float
+    y: float
+    radius: float
+
+    def __post_init__(self) -> None:
+        if not _finite_all((self.x, self.y, self.radius)) or self.radius <= 0.0:
+            raise ValueError("circular obstacle geometry is invalid")
+
+
+@dataclass(frozen=True)
 class PlanningMapSnapshot:
     """Immutable research snapshot; unknown cells are conservatively blocked."""
 
@@ -256,6 +269,7 @@ class PlanningMapSnapshot:
     source_artifact_hash: str = "synthetic-artifact"
     payload_content_hash: str = ""
     compiler_config_hash: str = "planning-grid-v1"
+    circular_obstacles: tuple[CircularObstacle, ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -263,6 +277,16 @@ class PlanningMapSnapshot:
         except TypeError as exc:
             raise ValueError("map rows must be a sequence") from exc
         object.__setattr__(self, "rows", normalized_rows)
+        try:
+            normalized_obstacles = tuple(self.circular_obstacles)
+        except TypeError as exc:
+            raise ValueError("circular obstacles must be a sequence") from exc
+        if any(
+            not isinstance(obstacle, CircularObstacle)
+            for obstacle in normalized_obstacles
+        ):
+            raise ValueError("circular obstacles must use CircularObstacle")
+        object.__setattr__(self, "circular_obstacles", normalized_obstacles)
         if not self.snapshot_id or not self.session_id or not self.map_frame:
             raise ValueError("map identity fields must be non-empty")
         if (
@@ -309,6 +333,7 @@ class PlanningMapSnapshot:
         source_artifact_hash: str = "synthetic-artifact",
         payload_content_hash: str = "",
         compiler_config_hash: str = "planning-grid-v1",
+        circular_obstacles: Sequence[CircularObstacle] = (),
     ) -> "PlanningMapSnapshot":
         return cls(
             snapshot_id=snapshot_id,
@@ -324,6 +349,7 @@ class PlanningMapSnapshot:
             source_artifact_hash=source_artifact_hash,
             payload_content_hash=payload_content_hash,
             compiler_config_hash=compiler_config_hash,
+            circular_obstacles=tuple(circular_obstacles),
         )
 
     def canonical_payload_hash(self) -> str:
@@ -333,6 +359,13 @@ class PlanningMapSnapshot:
                 f"{self.resolution:.17g}",
                 f"{self.footprint_radius:.17g}",
                 f"{self.required_clearance:.17g}",
+                *(
+                    "circle:"
+                    f"{obstacle.x:.17g},"
+                    f"{obstacle.y:.17g},"
+                    f"{obstacle.radius:.17g}"
+                    for obstacle in self.circular_obstacles
+                ),
                 *self.rows,
             )
         )
@@ -377,9 +410,24 @@ class PlanningMapSnapshot:
             _DISTANCE_FIELD_CACHE[key] = field
         return field
 
+    def precompute_clearance(self) -> None:
+        """Build the immutable grid clearance lookup before planning starts."""
+
+        if self.width * self.height >= _DISTANCE_FIELD_MIN_CELLS:
+            self._distance_field()
+
     def clearance_at(self, state: VesselState) -> float:
         if not state.is_finite():
             return float("-inf")
+        circle_clearance = min(
+            (
+                hypot(state.x - item.x, state.y - item.y)
+                - item.radius
+                - self.footprint_radius
+                for item in self.circular_obstacles
+            ),
+            default=float("inf"),
+        )
         x_min, y_min, x_max, y_max = self.bounds
         boundary = min(
             state.x - x_min,
@@ -400,7 +448,8 @@ class PlanningMapSnapshot:
                 - half_diagonal
                 - self.footprint_radius
             )
-            return min(boundary, obstacle)
+            grid_clearance = min(boundary, obstacle)
+            return min(grid_clearance, circle_clearance)
         obstacle = float("inf")
         for cell_x, cell_y in self._hard_cells():
             center_x = (cell_x + 0.5) * self.resolution
@@ -411,7 +460,8 @@ class PlanningMapSnapshot:
                 - half_diagonal
                 - self.footprint_radius,
             )
-        return min(boundary, obstacle)
+        grid_clearance = min(boundary, obstacle)
+        return min(grid_clearance, circle_clearance)
 
     def is_state_valid(self, state: VesselState) -> bool:
         if state.frame_id != self.map_frame or state.health != "healthy":

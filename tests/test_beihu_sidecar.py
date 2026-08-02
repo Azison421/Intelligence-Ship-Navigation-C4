@@ -82,6 +82,31 @@ def test_manifest_matches_route_evidence(compiled):
     assert scales[-1] > 2.0 * scales[0]  # the single 3x buoy
 
 
+def test_compiled_buoy_clearance_uses_exact_circle_geometry(compiled):
+    snapshot = compiled.snapshot
+    manifest = compiled.manifest
+    buoy = manifest.buoys[0]
+    x, y = enu_to_grid(manifest, buoy.x, buoy.y)
+    state = VesselState(
+        x=x,
+        y=y,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=snapshot.stamp_sim,
+    )
+
+    assert len(snapshot.circular_obstacles) == len(manifest.buoys)
+    assert snapshot.clearance_at(state) == pytest.approx(
+        -buoy.radius_m - snapshot.footprint_radius
+    )
+
+
+def test_default_national_map_resolution_is_point_two_metres(compiled):
+    assert compiled.snapshot.resolution == pytest.approx(0.2)
+    assert compiled.manifest.resolution_m == pytest.approx(0.2)
+
+
 def test_candidate_coverage_is_the_default(artifact):
     data, artifact_hash = artifact
     candidate = compile_beihu_sidecar(data, source_artifact_hash=artifact_hash, session_id="s")

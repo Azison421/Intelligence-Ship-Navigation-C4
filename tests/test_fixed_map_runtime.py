@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,8 @@ from usvlib4ros.navigation.fixed_map_runtime import (
 from usvlib4ros.planning import VesselState
 from usvlib4ros.planning.fixed_route import (
     compile_offline_national_map,
+    fixed_route_goal_xy,
+    fixed_route_planning_gate,
 )
 from usvlib4ros.policy import RecurrentDiscreteSAC
 
@@ -148,6 +151,61 @@ def test_runtime_core_plans_then_emits_only_fresh_safe_control():
     )
     assert laser.stop
     assert laser.reason == "LASER_EMERGENCY_STOP"
+
+
+def test_runtime_advances_displaced_gate_from_original_waypoint_region():
+    route, pose = _live_route_and_pose()
+    context = build_live_route_context(
+        route,
+        pose,
+        session_id="runtime-original-waypoint-test",
+    )
+    context = replace(context, start_index=5)
+    compiled = context.compiled_map
+    goal = fixed_route_goal_xy(compiled.manifest, 5)
+    gate = fixed_route_planning_gate(compiled, 5)
+    candidates = []
+    resolution = compiled.snapshot.resolution
+    min_x = max(0, int((goal[0] - 0.5) // resolution))
+    max_x = min(
+        compiled.snapshot.width - 1,
+        int((goal[0] + 0.5) // resolution),
+    )
+    min_y = max(0, int((goal[1] - 0.5) // resolution))
+    max_y = min(
+        compiled.snapshot.height - 1,
+        int((goal[1] + 0.5) // resolution),
+    )
+    for cell_y in range(min_y, max_y + 1):
+        for cell_x in range(min_x, max_x + 1):
+            state = VesselState(
+                x=(cell_x + 0.5) * compiled.snapshot.resolution,
+                y=(cell_y + 0.5) * compiled.snapshot.resolution,
+                yaw=0.0,
+                speed=0.0,
+                yaw_rate=0.0,
+                stamp_sim=compiled.snapshot.stamp_sim,
+            )
+            if (
+                math.hypot(state.x - goal[0], state.y - goal[1]) <= 0.5
+                and compiled.snapshot.is_state_valid(state)
+            ):
+                candidates.append(
+                    (math.hypot(state.x - gate[0], state.y - gate[1]), state)
+                )
+    gate_distance, reached_state = max(candidates, key=lambda item: item[0])
+    assert gate_distance > 0.2
+
+    core = FixedMapControllerCore(
+        context,
+        RecurrentDiscreteSAC(
+            observation_dim=162,
+            hidden_dim=16,
+            seed=31,
+        ),
+    )
+    assert not core._advance_reached_goals(reached_state)
+    assert core.mission_index == 6
 
 
 def test_live_policy_loader_rejects_checkpoint_without_evaluation(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from heapq import heappop, heappush
 from pathlib import Path
 from typing import Optional
 
@@ -31,11 +30,11 @@ from .kinodynamic_informed_rrtstar import (
 DATA_DIR = Path(__file__).resolve().parents[1] / "mapping" / "data"
 SIDECAR_PATH = DATA_DIR / "beihu_static_world_sidecar.json"
 LIVE_PROFILE_PATH = DATA_DIR / "national_test_live_profile.json"
-FIXED_ROUTE_TOLERANCE_M = 2.25
-MAX_FIXED_ROUTE_TOLERANCE_M = 4.0
-DISPLACED_GATE_TOLERANCE_M = 0.75
-SAFE_GATE_CLEARANCE_M = 0.7
-ROUTE_GUIDANCE_VERSION = "national-test-safe-gates-feedback-v3"
+FIXED_ROUTE_TOLERANCE_M = 0.5
+MAX_FIXED_ROUTE_TOLERANCE_M = FIXED_ROUTE_TOLERANCE_M
+DISPLACED_GATE_TOLERANCE_M = 0.3
+SAFE_GATE_CLEARANCE_M = 0.3
+ROUTE_GUIDANCE_VERSION = "national-test-exact-buoys-waypoints-v4"
 _ROUTE_GATE_CACHE: dict[tuple[str, int], tuple[float, float]] = {}
 
 
@@ -61,107 +60,31 @@ def fixed_route_tolerance(
     compiled_map: CompiledSidecarMap,
     mission_index: int,
 ) -> float:
-    """Smallest safe pass radius around the unchanged published target."""
+    """Required ship-centre radius around the unchanged published target."""
 
     manifest = compiled_map.manifest
-    snapshot = compiled_map.snapshot
     point_count = len(manifest.route_points_enu)
     _validate_route_index(point_count, mission_index)
-    goal_x, goal_y = fixed_route_goal_xy(manifest, mission_index)
-    gate_x, gate_y = fixed_route_planning_gate(
-        compiled_map,
+    return FIXED_ROUTE_TOLERANCE_M
+
+
+def fixed_route_waypoint_reached(
+    compiled_map: CompiledSidecarMap,
+    mission_index: int,
+    state: VesselState,
+) -> bool:
+    """Whether the ship centre entered the unchanged waypoint region."""
+
+    if not state.is_finite():
+        return False
+    goal_x, goal_y = fixed_route_goal_xy(
+        compiled_map.manifest,
         mission_index,
     )
-    gate_distance = math.hypot(gate_x - goal_x, gate_y - goal_y)
-    return min(
-        MAX_FIXED_ROUTE_TOLERANCE_M,
-        max(
-            FIXED_ROUTE_TOLERANCE_M,
-            gate_distance + DISPLACED_GATE_TOLERANCE_M,
-        ),
+    return (
+        math.hypot(state.x - goal_x, state.y - goal_y)
+        <= FIXED_ROUTE_TOLERANCE_M + 1e-9
     )
-
-
-def _route_grid_distances(
-    compiled_map: CompiledSidecarMap,
-    start: tuple[int, int],
-) -> dict[tuple[int, int], float]:
-    snapshot = compiled_map.snapshot
-    resolution = snapshot.resolution
-    state_cache: dict[tuple[int, int], VesselState] = {}
-    clearance_cache: dict[tuple[int, int], float] = {}
-
-    def cell_state(cell: tuple[int, int]) -> VesselState:
-        state = state_cache.get(cell)
-        if state is None:
-            state = VesselState(
-                x=(cell[0] + 0.5) * resolution,
-                y=(cell[1] + 0.5) * resolution,
-                yaw=0.0,
-                speed=0.0,
-                yaw_rate=0.0,
-                stamp_sim=snapshot.stamp_sim,
-            )
-            state_cache[cell] = state
-        return state
-
-    def cell_clearance(cell: tuple[int, int]) -> float:
-        clearance = clearance_cache.get(cell)
-        if clearance is None:
-            clearance = snapshot.clearance_at(cell_state(cell))
-            clearance_cache[cell] = clearance
-        return clearance
-
-    def traversable(cell: tuple[int, int]) -> bool:
-        return (
-            0 <= cell[0] < snapshot.width
-            and 0 <= cell[1] < snapshot.height
-            and cell_clearance(cell)
-            > snapshot.required_clearance + 1e-9
-        )
-
-    neighbors = (
-        (1, 0),
-        (-1, 0),
-        (0, 1),
-        (0, -1),
-        (1, 1),
-        (1, -1),
-        (-1, 1),
-        (-1, -1),
-    )
-    frontier = [(0.0, start)]
-    distances = {start: 0.0}
-    while frontier:
-        distance, cell = heappop(frontier)
-        if distance != distances[cell]:
-            continue
-        for dx, dy in neighbors:
-            candidate = (cell[0] + dx, cell[1] + dy)
-            if not traversable(candidate):
-                continue
-            if dx and dy and (
-                not traversable((cell[0] + dx, cell[1]))
-                or not traversable((cell[0], cell[1] + dy))
-            ):
-                continue
-            clearance_penalty = 0.03 / max(
-                cell_clearance(candidate) - snapshot.required_clearance,
-                0.02,
-            )
-            candidate_distance = (
-                distance
-                + math.hypot(dx, dy) * resolution
-                + clearance_penalty
-            )
-            if candidate_distance >= distances.get(
-                candidate,
-                float("inf"),
-            ):
-                continue
-            distances[candidate] = candidate_distance
-            heappush(frontier, (candidate_distance, candidate))
-    return distances
 
 
 def fixed_route_planning_gate(
@@ -196,10 +119,25 @@ def fixed_route_planning_gate(
         return goal
 
     resolution = snapshot.resolution
-    valid_cells: list[tuple[float, tuple[int, int]]] = []
-    safe_cells: list[tuple[float, tuple[int, int]]] = []
-    for cell_y in range(snapshot.height):
-        for cell_x in range(snapshot.width):
+    safe_cells: list[tuple[float, float, tuple[int, int]]] = []
+    min_cell_x = max(
+        0,
+        int((goal[0] - FIXED_ROUTE_TOLERANCE_M) // resolution),
+    )
+    max_cell_x = min(
+        snapshot.width - 1,
+        int((goal[0] + FIXED_ROUTE_TOLERANCE_M) // resolution),
+    )
+    min_cell_y = max(
+        0,
+        int((goal[1] - FIXED_ROUTE_TOLERANCE_M) // resolution),
+    )
+    max_cell_y = min(
+        snapshot.height - 1,
+        int((goal[1] + FIXED_ROUTE_TOLERANCE_M) // resolution),
+    )
+    for cell_y in range(min_cell_y, max_cell_y + 1):
+        for cell_x in range(min_cell_x, max_cell_x + 1):
             x = (cell_x + 0.5) * resolution
             y = (cell_y + 0.5) * resolution
             distance = math.hypot(x - goal[0], y - goal[1])
@@ -213,58 +151,19 @@ def fixed_route_planning_gate(
                 yaw_rate=0.0,
                 stamp_sim=snapshot.stamp_sim,
             )
-            if snapshot.is_state_valid(state):
-                item = (distance, (cell_x, cell_y))
-                valid_cells.append(item)
-                if (
-                    snapshot.clearance_at(state)
-                    >= SAFE_GATE_CLEARANCE_M
-                ):
-                    safe_cells.append(item)
-    if not valid_cells:
-        raise ValueError("fixed route point has no safe pass gate")
-    if safe_cells:
-        valid_cells = safe_cells
-    if mission_index == 0 or mission_index + 1 >= point_count:
-        gate_cell = min(valid_cells)[1]
-    else:
-        previous = fixed_route_planning_gate(
-            compiled_map,
-            mission_index - 1,
+            clearance = snapshot.clearance_at(state)
+            if (
+                snapshot.is_state_valid(state)
+                and clearance >= SAFE_GATE_CLEARANCE_M
+            ):
+                safe_cells.append(
+                    (distance, -clearance, (cell_x, cell_y))
+                )
+    if not safe_cells:
+        raise ValueError(
+            "fixed route point has no safe pass gate within 0.5 m"
         )
-        following = fixed_route_goal_xy(manifest, mission_index + 1)
-
-        def nearest_valid_cell(point: tuple[float, float]):
-            return min(
-                valid_cells,
-                key=lambda item: math.hypot(
-                    (item[1][0] + 0.5) * resolution - point[0],
-                    (item[1][1] + 0.5) * resolution - point[1],
-                ),
-            )[1]
-
-        incoming = _route_grid_distances(
-            compiled_map,
-            nearest_valid_cell(previous),
-        )
-        outgoing = _route_grid_distances(
-            compiled_map,
-            nearest_valid_cell(following),
-        )
-        connected = [
-            (distance, cell)
-            for distance, cell in valid_cells
-            if cell in incoming and cell in outgoing
-        ]
-        if not connected:
-            raise ValueError("fixed route pass gate is disconnected")
-        gate_cell = min(
-            connected,
-            key=lambda item: (
-                max(incoming[item[1]], outgoing[item[1]])
-                + 0.5 * item[0]
-            ),
-        )[1]
+    gate_cell = min(safe_cells)[2]
     gate = (
         (gate_cell[0] + 0.5) * resolution,
         (gate_cell[1] + 0.5) * resolution,
@@ -287,7 +186,7 @@ def fixed_route_gate_region(
     tolerance = (
         DISPLACED_GATE_TOLERANCE_M
         if displaced
-        else FIXED_ROUTE_TOLERANCE_M - 0.25
+        else FIXED_ROUTE_TOLERANCE_M
     )
     return gate[0], gate[1], tolerance
 
@@ -516,7 +415,7 @@ def plan_fixed_route(
     cost_config: Optional[CostConfig] = None,
     start_state: Optional[VesselState] = None,
     start_mission_index: int = 1,
-    time_budget_ms: float = 2_000.0,
+    time_budget_ms: float = 5_000.0,
     optimize_with_rrtstar: bool = False,
     seed: int = 31,
 ) -> FixedRoutePlan:
@@ -554,67 +453,24 @@ def plan_fixed_route(
     if not snapshot.is_state_valid(start_state):
         raise ValueError("fixed route start state is not valid")
 
-    planner = _route_planner(
-        optimize_with_rrtstar=optimize_with_rrtstar,
-    )
     trajectories = []
     state = start_state
-    mission_version = f"route-v{manifest.route_version}"
     for mission_index in range(
         start_mission_index,
         len(manifest.route_points_enu),
     ):
-        goal_x, goal_y = fixed_route_goal_xy(
-            manifest,
-            mission_index,
-        )
-        goal = GoalRegion(
-            x=goal_x,
-            y=goal_y,
-            position_tolerance=fixed_route_tolerance(
-                compiled_map,
-                mission_index,
-            ),
-            heading_tolerance=math.pi,
-            speed_limit=1.2,
-            yaw_rate_limit=1.2,
-        )
-        request = PlanningRequest(
-            request_id=f"fixed-route-leg-{mission_index - 1}-{mission_index}",
-            session_id=snapshot.session_id,
+        trajectory = plan_fixed_leg(
+            compiled_map,
             start_state=state,
-            goal_region=goal,
-            map_snapshot_id=snapshot.snapshot_id,
-            dynamics_version=dynamics.version,
-            cost_config_version=cost_config.version,
-            time_budget_ms=time_budget_ms,
-            seed=seed + mission_index,
             mission_index=mission_index,
-            stamp_sim=state.stamp_sim,
-            mission_version=mission_version,
-            route_gate=fixed_route_gate_region(
-                compiled_map,
-                mission_index,
-            ),
-            continuation_targets=fixed_route_continuations(
-                compiled_map,
-                mission_index,
-            ),
+            dynamics=dynamics,
+            cost_config=cost_config,
+            time_budget_ms=time_budget_ms,
+            optimize_with_rrtstar=optimize_with_rrtstar,
+            seed=seed,
         )
-        result = planner.plan(
-            request,
-            snapshot,
-            dynamics,
-            cost_config,
-            now_sim=state.stamp_sim,
-        )
-        if result.trajectory is None:
-            raise RuntimeError(
-                f"fixed route leg {mission_index - 1}->{mission_index} "
-                f"failed: {result.status.value} {result.reason}"
-            )
-        trajectories.append(result.trajectory)
-        state = result.trajectory.states[-1]
+        trajectories.append(trajectory)
+        state = trajectory.states[-1]
 
     return FixedRoutePlan(
         compiled_map=compiled_map,
@@ -636,6 +492,7 @@ __all__ = [
     "fixed_route_goal_xy",
     "fixed_route_planning_gate",
     "fixed_route_tolerance",
+    "fixed_route_waypoint_reached",
     "plan_fixed_leg",
     "plan_fixed_route",
 ]

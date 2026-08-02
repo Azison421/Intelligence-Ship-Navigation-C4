@@ -34,6 +34,7 @@ from usvlib4ros.planning.fixed_route import (
     compile_offline_national_map,
     fixed_route_gate_region,
     fixed_route_goal_xy,
+    fixed_route_waypoint_reached,
     plan_fixed_leg,
 )
 from usvlib4ros.policy.fixed_map_features import (
@@ -436,11 +437,11 @@ class FixedMapControllerCore:
     def _advance_reached_goals(self, state: VesselState) -> bool:
         points = self.context.compiled_map.manifest.route_points_enu
         while True:
-            _, _, gate_tolerance = fixed_route_gate_region(
+            if not fixed_route_waypoint_reached(
                 self.context.compiled_map,
                 self.mission_index,
-            )
-            if self._gate_distance(state) > gate_tolerance:
+                state,
+            ):
                 break
             if self.mission_index >= len(points) - 1:
                 return True
