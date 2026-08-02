@@ -1,0 +1,9 @@
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Project-local training and evaluation outputs.
+artifacts/checkpoints/
+artifacts/logs/

@@ -1,0 +1,63 @@
+"""Build-bound Beihu map compilation: pure-Python sidecar and coordinates."""
+
+from .coordinates import (
+    AffineAxisAlignedTransform,
+    AffineTransform2D,
+    GpsProjector,
+    RouteTransformVerification,
+    SimilarityTransform2D,
+    compass_yaw_deg_to_math_yaw_rad,
+    compass_yaw_rate_degs_to_math_rad_s,
+    fit_affine_unity_to_enu,
+    fit_route_converter,
+    fit_unity_to_enu,
+    math_yaw_rad_to_compass_deg,
+    verify_route_points,
+)
+from .sidecar_compiler import (
+    COVERAGE_CANDIDATE,
+    COVERAGE_COMPLETE,
+    CompiledSidecarMap,
+    FixedBuoy,
+    SidecarCompilerConfig,
+    SidecarMapManifest,
+    compile_beihu_sidecar,
+    enu_to_grid,
+    grid_to_enu,
+    load_sidecar_artifact,
+    unity_point_in_water,
+)
+from .grid_io import (
+    OCCUPANCY_GRID_SCHEMA_VERSION,
+    occupancy_grid_payload,
+    write_occupancy_grid,
+)
+
+__all__ = [
+    "COVERAGE_CANDIDATE",
+    "COVERAGE_COMPLETE",
+    "AffineAxisAlignedTransform",
+    "AffineTransform2D",
+    "CompiledSidecarMap",
+    "FixedBuoy",
+    "GpsProjector",
+    "RouteTransformVerification",
+    "SidecarCompilerConfig",
+    "SidecarMapManifest",
+    "SimilarityTransform2D",
+    "compass_yaw_deg_to_math_yaw_rad",
+    "compass_yaw_rate_degs_to_math_rad_s",
+    "compile_beihu_sidecar",
+    "enu_to_grid",
+    "fit_affine_unity_to_enu",
+    "fit_route_converter",
+    "fit_unity_to_enu",
+    "grid_to_enu",
+    "load_sidecar_artifact",
+    "math_yaw_rad_to_compass_deg",
+    "unity_point_in_water",
+    "verify_route_points",
+    "OCCUPANCY_GRID_SCHEMA_VERSION",
+    "occupancy_grid_payload",
+    "write_occupancy_grid",
+]

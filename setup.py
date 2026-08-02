@@ -1,5 +1,5 @@
 from setuptools import setup
-from setuptools import setuptools
+import setuptools
 
 
 setup(

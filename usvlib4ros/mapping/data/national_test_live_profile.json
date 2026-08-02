@@ -1,0 +1,19 @@
+{
+  "schema_version": "national-test-live-affine-v1",
+  "scene_id": "北湖",
+  "route_name": "National_Test",
+  "route_id": "aa74b6a21c9a4c53acccd4ba5e8abc57",
+  "route_source_version": 46,
+  "observed_ros_route_version": 1785568402934,
+  "source_artifact_sha256": "da7774f61676a1eaceeb36fae44b71626d10be77a5940598210dcacf46551821",
+  "fitted_affine": [
+    0.6321581945312119,
+    -0.14629506646630225,
+    0.19025639089919313,
+    0.8221200324141035,
+    -191.1658098488378,
+    -299.8015971810875
+  ],
+  "max_route_fit_residual_m": 0.0000115138023908,
+  "contains_sensitive_connection_data": false
+}

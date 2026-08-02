@@ -1,2 +1,4 @@
 roslibpy==1.6.0
 rosbags==0.9.23
+numpy==2.2.6
+torch==2.12.1
