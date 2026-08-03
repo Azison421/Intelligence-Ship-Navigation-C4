@@ -16,6 +16,17 @@ from usvlib4ros.planning import (
 from .recurrent_sac import LASER_COUNT, LocalObservationV2
 
 
+TRACKING_CRUISE_THROTTLE_CAP = 0.22
+TRACKING_TARGET_SPEED_MPS = 0.3
+TRACKING_REVERSE_BRAKE_SPEED_MPS = 0.4
+TRACKING_REVERSE_BRAKE_THROTTLE = -0.4
+TRACKING_PROXIMITY_CLEARANCE_M = 0.6
+TRACKING_PROXIMITY_BRAKE_SPEED_MPS = 0.2
+TRACKING_HEADING_KP = 0.8
+TRACKING_YAW_RATE_KD = 0.35
+TRACKING_RUDDER_LIMIT = 0.5
+
+
 @dataclass(frozen=True)
 class TrajectoryPreview:
     state_index: int
@@ -36,13 +47,27 @@ def preview_trajectory(
     state: VesselState,
     trajectory: Trajectory,
     previous_index: int,
+    *,
+    allow_reverse_branch_progress: bool = False,
 ) -> TrajectoryPreview:
     if not trajectory.controls or len(trajectory.states) < 2:
         raise ValueError("trajectory preview requires at least one control")
     if not 0 <= previous_index < len(trajectory.states):
         raise ValueError("previous trajectory index is out of range")
+    contains_reverse = any(
+        control.throttle < 0.0 for control in trajectory.controls
+    )
+    candidate_stop = min(
+        len(trajectory.states),
+        previous_index
+        + (
+            12
+            if not contains_reverse or allow_reverse_branch_progress
+            else 3
+        ),
+    )
     index = min(
-        range(previous_index, len(trajectory.states)),
+        range(previous_index, candidate_stop),
         key=lambda candidate: (
             math.hypot(
                 state.x - trajectory.states[candidate].x,
@@ -106,19 +131,128 @@ def feedback_tracking_control(
     preview: TrajectoryPreview,
     nominal_control: Control,
     dynamics: PrototypeReducedDynamics,
+    *,
+    yaw_rate: float = 0.0,
+    speed: float = 0.0,
+    clearance_m: float = float("inf"),
 ) -> Control:
-    """Center local actions on the live line-of-sight heading error."""
+    """Track the live line of sight without retaining stale open-loop rudder."""
 
+    if (
+        speed > TRACKING_REVERSE_BRAKE_SPEED_MPS
+        or (
+            clearance_m < TRACKING_PROXIMITY_CLEARANCE_M
+            and speed > TRACKING_PROXIMITY_BRAKE_SPEED_MPS
+        )
+    ):
+        return Control(
+            throttle=TRACKING_REVERSE_BRAKE_THROTTLE,
+            rudder=0.0,
+        )
+    rudder = dynamics.rudder_yaw_sign * (
+        TRACKING_HEADING_KP * preview.heading_error
+        - TRACKING_YAW_RATE_KD * yaw_rate
+    )
     rudder = max(
-        -0.1,
-        min(
-            0.1,
-            preview.heading_error * dynamics.rudder_yaw_sign,
-        ),
+        -TRACKING_RUDDER_LIMIT,
+        min(TRACKING_RUDDER_LIMIT, rudder),
     )
     return Control(
-        throttle=min(0.02, max(0.0, nominal_control.throttle)),
+        throttle=min(
+            nominal_control.throttle,
+            TRACKING_CRUISE_THROTTLE_CAP,
+        )
+        if speed < TRACKING_TARGET_SPEED_MPS
+        else 0.0,
         rudder=rudder,
+    )
+
+
+def reverse_tracking_control(
+    preview: TrajectoryPreview,
+    nominal_control: Control,
+    dynamics: PrototypeReducedDynamics,
+    *,
+    yaw_rate: float = 0.0,
+) -> Control:
+    """Track the planned escape while the stern is the leading end."""
+
+    if nominal_control.throttle >= 0.0:
+        raise ValueError("reverse tracking requires negative throttle")
+    reverse_heading_error = _angle_difference(
+        preview.heading_error + math.pi,
+        0.0,
+    )
+    rudder = dynamics.rudder_yaw_sign * (
+        TRACKING_HEADING_KP * reverse_heading_error
+        - TRACKING_YAW_RATE_KD * yaw_rate
+    )
+    return Control(
+        throttle=nominal_control.throttle,
+        rudder=max(
+            -TRACKING_RUDDER_LIMIT,
+            min(TRACKING_RUDDER_LIMIT, rudder),
+        ),
+    )
+
+
+def narrow_ingress_control(
+    *,
+    throttle: float,
+    heading_error: float = 0.0,
+    rudder_yaw_sign: float = -1.0,
+) -> Control:
+    """Continue into the published narrow target before arming reverse."""
+
+    return Control(
+        throttle=throttle,
+        rudder=max(
+            -0.5,
+            min(0.5, heading_error * rudder_yaw_sign),
+        ),
+    )
+
+
+def narrow_ingress_future_controls(
+    ingress_control: Control,
+    nominal_future_controls: Sequence[tuple[Control, float]],
+    *,
+    candidate_prefix_s: float = 0.3,
+    ingress_total_s: float = 0.8,
+) -> tuple[tuple[Control, float], ...]:
+    """Predict forward crossing followed by the reverse escape phase."""
+
+    return (
+        (ingress_control, ingress_total_s - candidate_prefix_s),
+        *tuple(nominal_future_controls),
+    )
+
+
+def tracking_future_controls(
+    tracking_control: Control,
+    nominal_future_controls: Sequence[tuple[Control, float]],
+    *,
+    closed_loop_hold_s: float = 0.5,
+) -> tuple[tuple[Control, float], ...]:
+    """Keep the live feedback correction active before the open-loop preview."""
+
+    return (
+        (tracking_control, closed_loop_hold_s),
+        *tuple(nominal_future_controls),
+    )
+
+
+def braking_future_controls(
+    braking_control: Control,
+    *,
+    brake_after_prefix_s: float = 0.7,
+    coast_after_brake_s: float = 1.0,
+) -> tuple[tuple[Control, float], ...]:
+    """Predict one-second active braking before a zero-thrust coast."""
+
+    return (
+        (braking_control, brake_after_prefix_s),
+        (Control(0.0, 0.0), coast_after_brake_s),
     )
 
 
@@ -211,8 +345,13 @@ def build_fixed_map_observation(
 
 __all__ = [
     "TrajectoryPreview",
+    "braking_future_controls",
     "build_fixed_map_observation",
     "feedback_tracking_control",
     "front_arc_laser_features",
+    "narrow_ingress_control",
+    "narrow_ingress_future_controls",
     "preview_trajectory",
+    "reverse_tracking_control",
+    "tracking_future_controls",
 ]

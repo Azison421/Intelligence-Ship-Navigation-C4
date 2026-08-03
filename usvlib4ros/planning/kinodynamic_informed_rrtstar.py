@@ -270,6 +270,9 @@ class PlanningMapSnapshot:
     payload_content_hash: str = ""
     compiler_config_hash: str = "planning-grid-v1"
     circular_obstacles: tuple[CircularObstacle, ...] = ()
+    vessel_capsule_length: float = 0.0
+    vessel_capsule_width: float = 0.0
+    geometry_version: str = "circle-v1"
 
     def __post_init__(self) -> None:
         try:
@@ -310,6 +313,26 @@ class PlanningMapSnapshot:
             raise ValueError("map geometry bounds are invalid")
         if not self.source_artifact_hash or not self.compiler_config_hash:
             raise ValueError("map artifact and compiler hashes are required")
+        if (
+            not self.geometry_version
+            or not _finite_all(
+                (self.vessel_capsule_length, self.vessel_capsule_width)
+            )
+            or self.vessel_capsule_length < 0.0
+            or self.vessel_capsule_width < 0.0
+            or (
+                (self.vessel_capsule_length == 0.0)
+                != (self.vessel_capsule_width == 0.0)
+            )
+            or (
+                self.vessel_capsule_length > 0.0
+                and (
+                    self.vessel_capsule_length < self.vessel_capsule_width
+                    or self.footprint_radius != 0.0
+                )
+            )
+        ):
+            raise ValueError("vessel footprint geometry is invalid")
         canonical_hash = self.canonical_payload_hash()
         if not self.payload_content_hash:
             object.__setattr__(self, "payload_content_hash", canonical_hash)
@@ -334,6 +357,9 @@ class PlanningMapSnapshot:
         payload_content_hash: str = "",
         compiler_config_hash: str = "planning-grid-v1",
         circular_obstacles: Sequence[CircularObstacle] = (),
+        vessel_capsule_length: float = 0.0,
+        vessel_capsule_width: float = 0.0,
+        geometry_version: str = "circle-v1",
     ) -> "PlanningMapSnapshot":
         return cls(
             snapshot_id=snapshot_id,
@@ -350,6 +376,9 @@ class PlanningMapSnapshot:
             payload_content_hash=payload_content_hash,
             compiler_config_hash=compiler_config_hash,
             circular_obstacles=tuple(circular_obstacles),
+            vessel_capsule_length=vessel_capsule_length,
+            vessel_capsule_width=vessel_capsule_width,
+            geometry_version=geometry_version,
         )
 
     def canonical_payload_hash(self) -> str:
@@ -359,6 +388,24 @@ class PlanningMapSnapshot:
                 f"{self.resolution:.17g}",
                 f"{self.footprint_radius:.17g}",
                 f"{self.required_clearance:.17g}",
+                *(
+                    (f"geometry:{self.geometry_version}",)
+                    if (
+                        self.vessel_capsule_length == 0.0
+                        and self.geometry_version != "circle-v1"
+                    )
+                    else ()
+                ),
+                *(
+                    (
+                        "capsule:"
+                        f"{self.geometry_version},"
+                        f"{self.vessel_capsule_length:.17g},"
+                        f"{self.vessel_capsule_width:.17g}",
+                    )
+                    if self.vessel_capsule_length > 0.0
+                    else ()
+                ),
                 *(
                     "circle:"
                     f"{obstacle.x:.17g},"
@@ -419,23 +466,103 @@ class PlanningMapSnapshot:
     def clearance_at(self, state: VesselState) -> float:
         if not state.is_finite():
             return float("-inf")
+        capsule = self.vessel_capsule_length > 0.0
+        if capsule:
+            capsule_radius = self.vessel_capsule_width / 2.0
+            half_segment = (
+                self.vessel_capsule_length - self.vessel_capsule_width
+            ) / 2.0
+            delta_x = half_segment * cos(state.yaw)
+            delta_y = half_segment * sin(state.yaw)
+            segment_start = (state.x - delta_x, state.y - delta_y)
+            segment_end = (state.x + delta_x, state.y + delta_y)
+        else:
+            capsule_radius = self.footprint_radius
+            half_segment = 0.0
+            segment_start = (state.x, state.y)
+            segment_end = segment_start
+
+        def point_segment_distance(x: float, y: float) -> float:
+            start_x, start_y = segment_start
+            end_x, end_y = segment_end
+            edge_x = end_x - start_x
+            edge_y = end_y - start_y
+            squared = edge_x * edge_x + edge_y * edge_y
+            if squared <= 1e-18:
+                return hypot(x - start_x, y - start_y)
+            fraction = _clamp(
+                ((x - start_x) * edge_x + (y - start_y) * edge_y)
+                / squared,
+                0.0,
+                1.0,
+            )
+            return hypot(
+                x - (start_x + fraction * edge_x),
+                y - (start_y + fraction * edge_y),
+            )
+
         circle_clearance = min(
             (
-                hypot(state.x - item.x, state.y - item.y)
+                point_segment_distance(item.x, item.y)
                 - item.radius
-                - self.footprint_radius
+                - capsule_radius
                 for item in self.circular_obstacles
             ),
             default=float("inf"),
         )
         x_min, y_min, x_max, y_max = self.bounds
-        boundary = min(
-            state.x - x_min,
-            x_max - state.x,
-            state.y - y_min,
-            y_max - state.y,
-        ) - self.footprint_radius
+        if capsule:
+            x_extent = abs(delta_x) + capsule_radius
+            y_extent = abs(delta_y) + capsule_radius
+            boundary = min(
+                state.x - x_min - x_extent,
+                x_max - state.x - x_extent,
+                state.y - y_min - y_extent,
+                y_max - state.y - y_extent,
+            )
+        else:
+            boundary = min(
+                state.x - x_min,
+                x_max - state.x,
+                state.y - y_min,
+                y_max - state.y,
+            ) - self.footprint_radius
         half_diagonal = self.resolution * sqrt(2.0) / 2.0
+        if capsule:
+            # Only cells close enough to influence the locked clearance gate
+            # need exact segment distance.  The fallback value deliberately
+            # underestimates farther grid clearance.
+            clearance_cap = max(0.5, self.required_clearance)
+            query_radius = (
+                half_segment
+                + capsule_radius
+                + half_diagonal
+                + clearance_cap
+            )
+            min_x = max(0, int((state.x - query_radius) // self.resolution))
+            max_x = min(
+                self.width - 1,
+                int((state.x + query_radius) // self.resolution),
+            )
+            min_y = max(0, int((state.y - query_radius) // self.resolution))
+            max_y = min(
+                self.height - 1,
+                int((state.y + query_radius) // self.resolution),
+            )
+            obstacle = clearance_cap
+            for cell_y in range(min_y, max_y + 1):
+                for cell_x in range(min_x, max_x + 1):
+                    if self.rows[cell_y][cell_x] not in "#?":
+                        continue
+                    center_x = (cell_x + 0.5) * self.resolution
+                    center_y = (cell_y + 0.5) * self.resolution
+                    obstacle = min(
+                        obstacle,
+                        point_segment_distance(center_x, center_y)
+                        - half_diagonal
+                        - capsule_radius,
+                    )
+            return min(boundary, obstacle, circle_clearance)
         if self.width * self.height >= _DISTANCE_FIELD_MIN_CELLS:
             cell = self._cell_for(state.x, state.y)
             if cell is None:
@@ -525,6 +652,7 @@ class PlanningRequest:
     cancelled: bool = False
     route_gate: Optional[tuple[float, float, float]] = None
     continuation_targets: tuple[tuple[float, float, float], ...] = ()
+    required_visit_regions: tuple[GoalRegion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -558,9 +686,15 @@ class PlannerConfig:
     max_map_age_s: float = 5.0
     max_throttle: float = 1.0
     max_abs_rudder: float = 1.0
+    forward_action_controls: tuple[Control, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "edge_durations", tuple(self.edge_durations))
+        object.__setattr__(
+            self,
+            "forward_action_controls",
+            tuple(self.forward_action_controls),
+        )
 
     def is_valid(self) -> bool:
         return (
@@ -593,6 +727,25 @@ class PlannerConfig:
             and self.max_map_age_s >= 0.0
             and 0.0 < self.max_throttle <= 1.0
             and 0.0 < self.max_abs_rudder <= 1.0
+            and (
+                not self.forward_action_controls
+                or (
+                    len(self.forward_action_controls) in (5, 6)
+                    and all(
+                        isinstance(control, Control)
+                        and control.is_valid()
+                        for control in self.forward_action_controls
+                    )
+                    and all(
+                        control.throttle >= 0.0
+                        for control in self.forward_action_controls[:5]
+                    )
+                    and (
+                        len(self.forward_action_controls) == 5
+                        or self.forward_action_controls[5].throttle < 0.0
+                    )
+                )
+            )
         )
 
 
@@ -609,6 +762,11 @@ class PrototypeReducedDynamics:
     yaw_response: float = 4.0
     rudder_yaw_sign: float = -1.0
     rudder_full_authority_speed: float = 0.3
+    positive_rudder_yaw_rate_gain: float = 0.0
+    negative_rudder_yaw_rate_gain: float = 0.0
+    allow_reverse: bool = False
+    max_reverse_speed: float = 0.0
+    reverse_throttle_speed_gain: float = 0.0
     integration_step_s: float = 0.1
     max_duration_s: float = MAX_EDGE_DURATION_S
     max_integration_steps: int = MAX_PROPAGATION_STEPS
@@ -624,6 +782,10 @@ class PrototypeReducedDynamics:
                 self.yaw_response,
                 self.rudder_yaw_sign,
                 self.rudder_full_authority_speed,
+                self.positive_rudder_yaw_rate_gain,
+                self.negative_rudder_yaw_rate_gain,
+                self.max_reverse_speed,
+                self.reverse_throttle_speed_gain,
                 self.integration_step_s,
                 self.max_duration_s,
             )
@@ -643,6 +805,20 @@ class PrototypeReducedDynamics:
             raise ValueError("dynamics configuration must be positive")
         if abs(abs(self.rudder_yaw_sign) - 1.0) > 1e-9:
             raise ValueError("rudder yaw sign must be either -1 or 1")
+        if (
+            self.positive_rudder_yaw_rate_gain < 0.0
+            or self.negative_rudder_yaw_rate_gain < 0.0
+            or self.max_reverse_speed < 0.0
+            or self.reverse_throttle_speed_gain < 0.0
+        ):
+            raise ValueError("optional dynamics gains must be non-negative")
+        if not isinstance(self.allow_reverse, bool):
+            raise ValueError("allow_reverse must be boolean")
+        if self.allow_reverse and min(
+            self.max_reverse_speed,
+            self.reverse_throttle_speed_gain,
+        ) <= 0.0:
+            raise ValueError("reverse dynamics must be calibrated")
         if self.rudder_full_authority_speed > self.max_speed:
             raise ValueError("rudder authority speed exceeds maximum speed")
         if not isinstance(self.max_integration_steps, int) or not (
@@ -655,7 +831,10 @@ class PrototypeReducedDynamics:
             raise ValueError("state is invalid")
         if not control.is_valid():
             raise ValueError("control is invalid")
-        if not 0.0 <= state.speed <= self.max_speed:
+        minimum_speed = (
+            -self.max_reverse_speed if self.allow_reverse else 0.0
+        )
+        if not minimum_speed <= state.speed <= self.max_speed:
             raise ValueError("speed is outside dynamics bounds")
         if abs(state.yaw_rate) > self.max_yaw_rate + 1e-9:
             raise ValueError("yaw rate is outside dynamics bounds")
@@ -680,23 +859,42 @@ class PrototypeReducedDynamics:
         current = state
         rollout = [state]
         for _ in range(steps):
-            target_speed = min(
-                self.max_speed,
-                max(0.0, control.throttle) * self.throttle_speed_gain,
-            )
+            if control.throttle < 0.0 and self.allow_reverse:
+                target_speed = max(
+                    -self.max_reverse_speed,
+                    control.throttle
+                    * self.reverse_throttle_speed_gain,
+                )
+            else:
+                target_speed = min(
+                    self.max_speed,
+                    max(0.0, control.throttle)
+                    * self.throttle_speed_gain,
+                )
             speed_alpha = min(1.0, self.speed_response * step)
             yaw_alpha = min(1.0, self.yaw_response * step)
             next_speed = current.speed + (target_speed - current.speed) * speed_alpha
             rudder_authority = _clamp(
-                max(current.speed, next_speed)
+                max(abs(current.speed), abs(next_speed))
                 / self.rudder_full_authority_speed,
                 0.0,
                 1.0,
             )
+            yaw_gain = self.rudder_yaw_rate_gain
+            if (
+                control.rudder > 0.0
+                and self.positive_rudder_yaw_rate_gain > 0.0
+            ):
+                yaw_gain = self.positive_rudder_yaw_rate_gain
+            elif (
+                control.rudder < 0.0
+                and self.negative_rudder_yaw_rate_gain > 0.0
+            ):
+                yaw_gain = self.negative_rudder_yaw_rate_gain
             target_yaw_rate = _clamp(
                 self.rudder_yaw_sign
                 * control.rudder
-                * self.rudder_yaw_rate_gain
+                * yaw_gain
                 * rudder_authority,
                 -self.max_yaw_rate,
                 self.max_yaw_rate,
@@ -712,7 +910,11 @@ class PrototypeReducedDynamics:
                 x=current.x + next_speed * cos(next_yaw) * step,
                 y=current.y + next_speed * sin(next_yaw) * step,
                 yaw=next_yaw,
-                speed=_clamp(next_speed, 0.0, self.max_speed),
+                speed=_clamp(
+                    next_speed,
+                    -self.max_reverse_speed if self.allow_reverse else 0.0,
+                    self.max_speed,
+                ),
                 yaw_rate=next_yaw_rate,
                 throttle_state=control.throttle,
                 rudder_state=control.rudder,
@@ -882,6 +1084,26 @@ class TrajectoryValidator:
         terminal = trajectory.states[-1]
         if not map_snapshot.is_state_valid(terminal):
             return TrajectoryValidation(False, "TERMINAL_STATE_INVALID", minimum, recomputed_cost)
+        required_index = 0
+        sampled_states = [trajectory.states[0]]
+        sampled_states.extend(
+            state
+            for rollout in trajectory.edge_rollouts
+            for state in rollout[1:]
+        )
+        for state in sampled_states:
+            if (
+                required_index < len(request.required_visit_regions)
+                and request.required_visit_regions[required_index].contains(state)
+            ):
+                required_index += 1
+        if required_index != len(request.required_visit_regions):
+            return TrajectoryValidation(
+                False,
+                "REQUIRED_VISIT_NOT_MET",
+                minimum,
+                recomputed_cost,
+            )
         if not request.goal_region.contains(terminal):
             return TrajectoryValidation(False, "GOAL_TOLERANCE_NOT_MET", minimum, recomputed_cost)
         position_error = hypot(terminal.x - request.goal_region.x, terminal.y - request.goal_region.y)
@@ -1023,6 +1245,456 @@ class KinodynamicInformedRRTStarPlanner:
     def __init__(self, config: Optional[PlannerConfig] = None) -> None:
         self.config = config or PlannerConfig()
 
+    def _forward_action_controls(self) -> tuple[Control, ...]:
+        if self.config.forward_action_controls:
+            return self.config.forward_action_controls
+        throttle = self.config.max_throttle
+        rudder = self.config.max_abs_rudder
+        return (
+            Control(throttle, -rudder),
+            Control(throttle, -0.5 * rudder),
+            Control(throttle, 0.0),
+            Control(throttle, 0.5 * rudder),
+            Control(throttle, rudder),
+        )
+
+    def _forward_lattice_seed_trajectory(
+        self,
+        request: PlanningRequest,
+        map_snapshot: PlanningMapSnapshot,
+        dynamics: PrototypeReducedDynamics,
+        cost_config: CostConfig,
+        *,
+        deadline: float,
+        action_controls: Optional[tuple[Control, ...]] = None,
+    ) -> Optional[Trajectory]:
+        from .forward_state_lattice import ForwardStateLatticePlanner
+
+        seed = ForwardStateLatticePlanner().plan(
+            request,
+            map_snapshot,
+            dynamics,
+            action_controls or self._forward_action_controls(),
+            deadline=deadline,
+        )
+        if seed is None:
+            return None
+        times = [0.0]
+        for duration in seed.durations:
+            times.append(times[-1] + duration)
+        total_length = sum(
+            hypot(second.x - first.x, second.y - first.y)
+            for rollout in seed.edge_rollouts
+            for first, second in zip(rollout, rollout[1:])
+        )
+        total_cost = (
+            cost_config.w_time * times[-1]
+            + cost_config.w_length * total_length
+            + cost_config.w_control
+            * sum(
+                control.throttle * control.throttle
+                + control.rudder * control.rudder
+                for control in seed.controls
+            )
+        )
+        trajectory = Trajectory(
+            trajectory_id=f"{request.request_id}-forward-lattice-seed",
+            request_id=request.request_id,
+            session_id=request.session_id,
+            map_snapshot_id=map_snapshot.snapshot_id,
+            map_source_version=map_snapshot.source_version,
+            map_payload_content_hash=map_snapshot.payload_content_hash,
+            dynamics_version=dynamics.version,
+            validator_version=TrajectoryValidator.version,
+            frame_id=map_snapshot.map_frame,
+            mission_index=request.mission_index,
+            mission_version=request.mission_version,
+            map_source_artifact_hash=map_snapshot.source_artifact_hash,
+            map_compiler_config_hash=map_snapshot.compiler_config_hash,
+            state_version=request.start_state.state_version,
+            states=seed.states,
+            controls=seed.controls,
+            durations=seed.durations,
+            times=tuple(times),
+            edge_rollouts=seed.edge_rollouts,
+            cost=total_cost,
+            min_clearance=0.0,
+            validation_status="UNVALIDATED",
+            terminal_position_error=0.0,
+            terminal_heading_error=0.0,
+            terminal_speed=seed.states[-1].speed,
+            terminal_yaw_rate=seed.states[-1].yaw_rate,
+        )
+        validation = TrajectoryValidator().validate(
+            trajectory,
+            request,
+            map_snapshot,
+            dynamics,
+            cost_config,
+        )
+        if not validation.valid:
+            return None
+        return replace(
+            trajectory,
+            cost=validation.cost,
+            min_clearance=validation.min_clearance,
+            validation_status=validation.reason,
+            terminal_position_error=validation.position_error,
+            terminal_heading_error=validation.heading_error,
+        )
+
+    def _reverse_escape_seed_trajectory(
+        self,
+        request: PlanningRequest,
+        map_snapshot: PlanningMapSnapshot,
+        dynamics: PrototypeReducedDynamics,
+        cost_config: CostConfig,
+        *,
+        deadline: float,
+        allow_entry_recovery: bool = True,
+    ) -> Optional[Trajectory]:
+        controls = self._forward_action_controls()
+        reverse_controls = tuple(
+            control for control in controls if control.throttle < 0.0
+        )
+        forward_controls = tuple(
+            control for control in controls if control.throttle >= 0.0
+        )
+        if (
+            not dynamics.allow_reverse
+            or len(reverse_controls) != 1
+            or len(forward_controls) != 5
+            or not request.required_visit_regions
+        ):
+            return None
+        visit_gate = request.required_visit_regions[0]
+        approach_yaw = atan2(
+            visit_gate.y - request.start_state.y,
+            visit_gate.x - request.start_state.x,
+        )
+        direction_x = -cos(approach_yaw)
+        direction_y = -sin(approach_yaw)
+        reverse_control = reverse_controls[0]
+        for staging_offset in (0.45, 0.25, 0.35, 0.55):
+            if perf_counter() >= deadline:
+                return None
+            staging_request = replace(
+                request,
+                goal_region=GoalRegion(
+                    x=visit_gate.x + staging_offset * direction_x,
+                    y=visit_gate.y + staging_offset * direction_y,
+                    position_tolerance=0.15,
+                    desired_yaw=approach_yaw,
+                    heading_tolerance=pi / 6.0,
+                    speed_limit=request.goal_region.speed_limit,
+                    yaw_rate_limit=request.goal_region.yaw_rate_limit,
+                ),
+                route_gate=None,
+                continuation_targets=(),
+                required_visit_regions=(),
+            )
+            ingress = (
+                None
+                if (
+                    allow_entry_recovery
+                    and abs(request.start_state.yaw_rate) > 0.3
+                )
+                else self._forward_lattice_seed_trajectory(
+                    staging_request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                    deadline=deadline,
+                    action_controls=forward_controls,
+                )
+            )
+            if ingress is None:
+                for recovery_control in forward_controls:
+                    if perf_counter() >= deadline:
+                        return None
+                    try:
+                        recovery_rollout = dynamics.propagate(
+                            request.start_state,
+                            recovery_control,
+                            0.4,
+                        )
+                    except (ArithmeticError, TypeError, ValueError):
+                        continue
+                    if not map_snapshot.check_motion(
+                        recovery_rollout
+                    ).valid:
+                        continue
+                    recovered_approach_yaw = atan2(
+                        visit_gate.y - recovery_rollout[-1].y,
+                        visit_gate.x - recovery_rollout[-1].x,
+                    )
+                    recovered_request = replace(
+                        staging_request,
+                        start_state=recovery_rollout[-1],
+                        stamp_sim=recovery_rollout[-1].stamp_sim,
+                        goal_region=replace(
+                            staging_request.goal_region,
+                            x=(
+                                visit_gate.x
+                                - staging_offset
+                                * cos(recovered_approach_yaw)
+                            ),
+                            y=(
+                                visit_gate.y
+                                - staging_offset
+                                * sin(recovered_approach_yaw)
+                            ),
+                            desired_yaw=recovered_approach_yaw,
+                        ),
+                    )
+                    suffix = self._forward_lattice_seed_trajectory(
+                        recovered_request,
+                        map_snapshot,
+                        dynamics,
+                        cost_config,
+                        deadline=deadline,
+                        action_controls=forward_controls,
+                    )
+                    if suffix is None:
+                        continue
+                    ingress = replace(
+                        suffix,
+                        trajectory_id=(
+                            f"{request.request_id}-entry-recovery-seed"
+                        ),
+                        states=(
+                            request.start_state,
+                            *suffix.states,
+                        ),
+                        controls=(
+                            recovery_control,
+                            *suffix.controls,
+                        ),
+                        durations=(0.4, *suffix.durations),
+                        times=(
+                            0.0,
+                            *(
+                                0.4 + value
+                                for value in suffix.times
+                            ),
+                        ),
+                        edge_rollouts=(
+                            recovery_rollout,
+                            *suffix.edge_rollouts,
+                        ),
+                    )
+                    break
+            if ingress is None:
+                continue
+            states = list(ingress.states)
+            combined_controls = list(ingress.controls)
+            durations = list(ingress.durations)
+            rollouts = list(ingress.edge_rollouts)
+            visit_index = 0
+            for state in (
+                ingress.states[0],
+                *(
+                    sample
+                    for rollout in ingress.edge_rollouts
+                    for sample in rollout[1:]
+                ),
+            ):
+                while (
+                    visit_index < len(request.required_visit_regions)
+                    and request.required_visit_regions[visit_index].contains(
+                        state
+                    )
+                ):
+                    visit_index += 1
+            while sum(durations) < 40.0 and perf_counter() < deadline:
+                try:
+                    rollout = dynamics.propagate(
+                        states[-1],
+                        reverse_control,
+                        0.8,
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    break
+                if not map_snapshot.check_motion(rollout).valid:
+                    break
+                combined_controls.append(reverse_control)
+                durations.append(0.8)
+                rollouts.append(rollout)
+                states.append(rollout[-1])
+                for state in rollout[1:]:
+                    while (
+                        visit_index < len(request.required_visit_regions)
+                        and request.required_visit_regions[
+                            visit_index
+                        ].contains(state)
+                    ):
+                        visit_index += 1
+                if (
+                    visit_index == len(request.required_visit_regions)
+                    and request.goal_region.contains(states[-1])
+                ):
+                    break
+            if (
+                visit_index != len(request.required_visit_regions)
+                or not request.goal_region.contains(states[-1])
+            ):
+                continue
+            times = [0.0]
+            for duration in durations:
+                times.append(times[-1] + duration)
+            total_length = sum(
+                hypot(second.x - first.x, second.y - first.y)
+                for rollout in rollouts
+                for first, second in zip(rollout, rollout[1:])
+            )
+            total_cost = (
+                cost_config.w_time * times[-1]
+                + cost_config.w_length * total_length
+                + cost_config.w_control
+                * sum(
+                    control.throttle * control.throttle
+                    + control.rudder * control.rudder
+                    for control in combined_controls
+                )
+            )
+            candidate = replace(
+                ingress,
+                trajectory_id=(
+                    f"{request.request_id}-reverse-escape-seed"
+                ),
+                states=tuple(states),
+                controls=tuple(combined_controls),
+                durations=tuple(durations),
+                times=tuple(times),
+                edge_rollouts=tuple(rollouts),
+                cost=total_cost,
+                min_clearance=0.0,
+                validation_status="UNVALIDATED",
+                terminal_position_error=0.0,
+                terminal_heading_error=0.0,
+                terminal_speed=states[-1].speed,
+                terminal_yaw_rate=states[-1].yaw_rate,
+            )
+            validation = TrajectoryValidator().validate(
+                candidate,
+                request,
+                map_snapshot,
+                dynamics,
+                cost_config,
+            )
+            if validation.valid:
+                return replace(
+                    candidate,
+                    cost=validation.cost,
+                    min_clearance=validation.min_clearance,
+                    validation_status=validation.reason,
+                    terminal_position_error=validation.position_error,
+                    terminal_heading_error=validation.heading_error,
+                )
+        if allow_entry_recovery:
+            for recovery_control in forward_controls:
+                if perf_counter() >= deadline:
+                    break
+                try:
+                    recovery_rollout = dynamics.propagate(
+                        request.start_state,
+                        recovery_control,
+                        0.4,
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    continue
+                if not map_snapshot.check_motion(recovery_rollout).valid:
+                    continue
+                recovered_request = replace(
+                    request,
+                    start_state=recovery_rollout[-1],
+                    stamp_sim=recovery_rollout[-1].stamp_sim,
+                )
+                suffix = self._reverse_escape_seed_trajectory(
+                    recovered_request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                    deadline=deadline,
+                    allow_entry_recovery=False,
+                )
+                if suffix is None:
+                    continue
+                states = (
+                    request.start_state,
+                    *suffix.states,
+                )
+                controls = (
+                    recovery_control,
+                    *suffix.controls,
+                )
+                durations = (0.4, *suffix.durations)
+                rollouts = (
+                    recovery_rollout,
+                    *suffix.edge_rollouts,
+                )
+                times = [0.0]
+                for duration in durations:
+                    times.append(times[-1] + duration)
+                total_length = sum(
+                    hypot(
+                        second.x - first.x,
+                        second.y - first.y,
+                    )
+                    for rollout in rollouts
+                    for first, second in zip(
+                        rollout,
+                        rollout[1:],
+                    )
+                )
+                total_cost = (
+                    cost_config.w_time * times[-1]
+                    + cost_config.w_length * total_length
+                    + cost_config.w_control
+                    * sum(
+                        control.throttle * control.throttle
+                        + control.rudder * control.rudder
+                        for control in controls
+                    )
+                )
+                candidate = replace(
+                    suffix,
+                    trajectory_id=(
+                        f"{request.request_id}-entry-recovery-seed"
+                    ),
+                    states=tuple(states),
+                    controls=tuple(controls),
+                    durations=tuple(durations),
+                    times=tuple(times),
+                    edge_rollouts=tuple(rollouts),
+                    cost=total_cost,
+                    min_clearance=0.0,
+                    validation_status="UNVALIDATED",
+                    terminal_speed=states[-1].speed,
+                    terminal_yaw_rate=states[-1].yaw_rate,
+                )
+                validation = TrajectoryValidator().validate(
+                    candidate,
+                    request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                )
+                if validation.valid:
+                    return replace(
+                        candidate,
+                        cost=validation.cost,
+                        min_clearance=validation.min_clearance,
+                        validation_status=validation.reason,
+                        terminal_position_error=(
+                            validation.position_error
+                        ),
+                        terminal_heading_error=(
+                            validation.heading_error
+                        ),
+                    )
+        return None
+
     def _grid_seed_trajectory(
         self,
         request: PlanningRequest,
@@ -1042,6 +1714,161 @@ class KinodynamicInformedRRTStarPlanner:
 
         if not self.config.grid_seed_enabled:
             return None
+        if request.required_visit_regions:
+            if any(
+                control.throttle < 0.0
+                for control in self._forward_action_controls()
+            ):
+                return self._reverse_escape_seed_trajectory(
+                    request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                    deadline=deadline,
+                )
+            return self._forward_lattice_seed_trajectory(
+                request,
+                map_snapshot,
+                dynamics,
+                cost_config,
+                deadline=deadline,
+            )
+        if request.start_state.speed < -1e-6:
+            forward_controls = tuple(
+                control
+                for control in self._forward_action_controls()
+                if control.throttle >= 0.0
+            )
+            if len(forward_controls) != 5:
+                return None
+            recovery_control = forward_controls[2]
+            try:
+                recovery_rollout = dynamics.propagate(
+                    request.start_state,
+                    recovery_control,
+                    0.8,
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            if not map_snapshot.check_motion(recovery_rollout).valid:
+                return None
+            recovery_request = replace(
+                request,
+                start_state=recovery_rollout[-1],
+                stamp_sim=recovery_rollout[-1].stamp_sim,
+            )
+            suffix = self._grid_seed_trajectory(
+                recovery_request,
+                map_snapshot,
+                dynamics,
+                cost_config,
+                deadline=deadline,
+            )
+            if suffix is None:
+                return None
+            states = (
+                request.start_state,
+                recovery_rollout[-1],
+                *suffix.states[1:],
+            )
+            controls = (recovery_control, *suffix.controls)
+            durations = (0.8, *suffix.durations)
+            rollouts = (recovery_rollout, *suffix.edge_rollouts)
+            times = [0.0]
+            for duration in durations:
+                times.append(times[-1] + duration)
+            total_length = sum(
+                hypot(second.x - first.x, second.y - first.y)
+                for rollout in rollouts
+                for first, second in zip(rollout, rollout[1:])
+            )
+            total_cost = (
+                cost_config.w_time * times[-1]
+                + cost_config.w_length * total_length
+                + cost_config.w_control
+                * sum(
+                    control.throttle * control.throttle
+                    + control.rudder * control.rudder
+                    for control in controls
+                )
+            )
+            candidate = replace(
+                suffix,
+                trajectory_id=(
+                    f"{request.request_id}-reverse-recovery-seed"
+                ),
+                states=tuple(states),
+                controls=tuple(controls),
+                durations=tuple(durations),
+                times=tuple(times),
+                edge_rollouts=tuple(rollouts),
+                cost=total_cost,
+                min_clearance=0.0,
+                validation_status="UNVALIDATED",
+                terminal_speed=states[-1].speed,
+                terminal_yaw_rate=states[-1].yaw_rate,
+            )
+            validation = TrajectoryValidator().validate(
+                candidate,
+                request,
+                map_snapshot,
+                dynamics,
+                cost_config,
+            )
+            if not validation.valid:
+                return None
+            return replace(
+                candidate,
+                cost=validation.cost,
+                min_clearance=validation.min_clearance,
+                validation_status=validation.reason,
+                terminal_position_error=validation.position_error,
+                terminal_heading_error=validation.heading_error,
+            )
+        if request.route_gate is not None:
+            gate = request.route_gate
+            gate_request = replace(
+                request,
+                goal_region=GoalRegion(
+                    x=gate[0],
+                    y=gate[1],
+                    position_tolerance=gate[2],
+                    heading_tolerance=pi,
+                    speed_limit=request.goal_region.speed_limit,
+                    yaw_rate_limit=request.goal_region.yaw_rate_limit,
+                ),
+                route_gate=None,
+                continuation_targets=(),
+            )
+            candidate = self._forward_lattice_seed_trajectory(
+                gate_request,
+                map_snapshot,
+                dynamics,
+                cost_config,
+                deadline=min(deadline, perf_counter() + 1.0),
+                action_controls=tuple(
+                    control
+                    for control in self._forward_action_controls()
+                    if control.throttle >= 0.0
+                ),
+            )
+            if candidate is not None:
+                validation = TrajectoryValidator().validate(
+                    candidate,
+                    request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                )
+                if validation.valid:
+                    return replace(
+                        candidate,
+                        cost=validation.cost,
+                        min_clearance=validation.min_clearance,
+                        validation_status=validation.reason,
+                        terminal_position_error=validation.position_error,
+                        terminal_heading_error=validation.heading_error,
+                    )
         start_cell = map_snapshot._cell_for(
             request.start_state.x,
             request.start_state.y,
@@ -1435,6 +2262,36 @@ class KinodynamicInformedRRTStarPlanner:
         control_period = min(0.1, dynamics.max_duration_s)
         lookahead_distance = max(0.8, 1.6 * resolution)
         max_steps = max(1, int(120.0 / control_period))
+        profile_controls = tuple(
+            control
+            for control in self._forward_action_controls()
+            if control.throttle >= 0.0
+        )
+
+        def tracking_control(yaw_error: float) -> Control:
+            if not self.config.forward_action_controls:
+                return Control(
+                    throttle=0.05,
+                    rudder=_clamp(
+                        yaw_error * dynamics.rudder_yaw_sign,
+                        -0.1,
+                        0.1,
+                    ),
+                )
+            magnitude = abs(yaw_error)
+            if magnitude < 0.08:
+                return profile_controls[2]
+            if yaw_error > 0.0:
+                return (
+                    profile_controls[0]
+                    if magnitude >= 0.35
+                    else profile_controls[1]
+                )
+            return (
+                profile_controls[4]
+                if magnitude >= 0.35
+                else profile_controls[3]
+            )
 
         def reached_planning_gate(state: VesselState) -> bool:
             if not request.goal_region.contains(state):
@@ -1449,8 +2306,7 @@ class KinodynamicInformedRRTStarPlanner:
 
         # A safe measured state can lie inside the planner's extra tracking
         # margin while facing away from the first high-clearance grid cell.
-        # Turn under low propulsion before path tracking: the live vessel has
-        # no stationary rudder authority.
+        # Turn with a calibrated discrete primitive before path tracking.
         initial_lookahead = 0
         while (
             initial_lookahead + 1 < len(path)
@@ -1477,9 +2333,6 @@ class KinodynamicInformedRRTStarPlanner:
                 preferred_direction,
                 -preferred_direction,
             ):
-                actuator_direction = (
-                    yaw_direction * dynamics.rudder_yaw_sign
-                )
                 recovery_state = request.start_state
                 recovery_states: list[VesselState] = []
                 recovery_controls: list[Control] = []
@@ -1494,9 +2347,9 @@ class KinodynamicInformedRRTStarPlanner:
                     )
                     if abs(remaining_yaw_error) <= 0.25:
                         break
-                    recovery_control = Control(
-                        throttle=0.05,
-                        rudder=0.1 * actuator_direction,
+                    recovery_control = tracking_control(
+                        yaw_direction
+                        * max(abs(remaining_yaw_error), 0.5)
                     )
                     try:
                         recovery_rollout = dynamics.propagate(
@@ -1595,19 +2448,7 @@ class KinodynamicInformedRRTStarPlanner:
             ):
                 desired_yaw = request.goal_region.desired_yaw
             yaw_error = _angle_difference(desired_yaw, current_state.yaw)
-            control = Control(
-                throttle=(
-                    0.02
-                    if goal_distance
-                    <= request.goal_region.position_tolerance + 1.0
-                    else 0.05
-                ),
-                rudder=_clamp(
-                    yaw_error * dynamics.rudder_yaw_sign,
-                    -0.1,
-                    0.1,
-                ),
-            )
+            control = tracking_control(yaw_error)
             try:
                 rollout = dynamics.propagate(
                     current_state,
@@ -2002,6 +2843,17 @@ class KinodynamicInformedRRTStarPlanner:
                 PlanStatus.INVALID_REQUEST,
                 "INVALID_CONTINUATION_TARGET",
             )
+        if (
+            not isinstance(request.required_visit_regions, tuple)
+            or any(
+                not isinstance(region, GoalRegion) or not region.is_valid()
+                for region in request.required_visit_regions
+            )
+        ):
+            return finish(
+                PlanStatus.INVALID_REQUEST,
+                "INVALID_REQUIRED_VISIT_REGION",
+            )
         if request.start_state.stamp_sim != request.stamp_sim:
             return finish(PlanStatus.STALE_REQUEST, "STATE_TIME_MISMATCH")
         request_age = float(now_sim) - request.stamp_sim
@@ -2049,6 +2901,7 @@ class KinodynamicInformedRRTStarPlanner:
             request.goal_region.contains(request.start_state)
             and request.route_gate is None
             and not request.continuation_targets
+            and not request.required_visit_regions
         ):
             trajectory = self._zero_trajectory(request, map_snapshot, dynamics, cost_config)
             return finish(PlanStatus.SUCCESS, "START_ALREADY_IN_GOAL", trajectory)
@@ -2058,7 +2911,12 @@ class KinodynamicInformedRRTStarPlanner:
         deadline = started + min(request.time_budget_ms, MAX_REQUEST_TIME_BUDGET_MS) / 1000.0
         validator = TrajectoryValidator()
 
-        if request.route_gate is not None or request.continuation_targets:
+        structured_seed = (
+            request.route_gate is not None
+            or bool(request.continuation_targets)
+            or bool(request.required_visit_regions)
+        )
+        if structured_seed:
             seed_trajectory = self._grid_seed_trajectory(
                 request,
                 map_snapshot,
@@ -2071,55 +2929,64 @@ class KinodynamicInformedRRTStarPlanner:
                     PlanStatus.NO_PATH,
                     "ROUTE_CONTINUATION_NO_VALIDATED_SEED",
                 )
-            return finish(
-                PlanStatus.SUCCESS,
-                "VALIDATED_KINODYNAMIC_GRID_SEED",
-                seed_trajectory,
-            )
+            best_cost = seed_trajectory.cost
+            best_node = 0
+            best_trajectory = seed_trajectory
+            if self.config.stop_on_first_solution:
+                return finish(
+                    PlanStatus.SUCCESS,
+                    (
+                        "VALIDATED_FORWARD_LATTICE_SEED"
+                        if request.required_visit_regions
+                        else "VALIDATED_KINODYNAMIC_GRID_SEED"
+                    ),
+                    seed_trajectory,
+                )
 
         # A goal connection is a standard RRT* completeness aid: try the
         # current tree root deterministically before spending the budget on
         # random samples.  The connector still uses the reduced dynamics,
         # continuous motion check and independent trajectory validator, so an
         # obstructed direct path simply falls through to tree growth.
-        direct_connection, used = self._connect(
-            request.start_state,
-            goal_state,
-            request.goal_region,
-            map_snapshot,
-            dynamics,
-            cost_config,
-            require_endpoint=True,
-            deadline=deadline,
-            diagnostics=propagation_diagnostics,
-        )
-        propagation_count += used
-        if direct_connection is not None and request.goal_region.contains(direct_connection.end_state):
-            direct_index = len(nodes)
-            nodes.append(
-                _Node(
-                    direct_connection.end_state,
-                    0,
-                    direct_connection.control,
-                    direct_connection.duration,
-                    direct_connection.rollout,
-                    direct_connection.edge_cost,
-                )
-            )
-            direct_trajectory = self._trajectory_from_node(
-                nodes,
-                direct_index,
-                request,
+        if not request.required_visit_regions:
+            direct_connection, used = self._connect(
+                request.start_state,
+                goal_state,
+                request.goal_region,
                 map_snapshot,
                 dynamics,
                 cost_config,
+                require_endpoint=True,
+                deadline=deadline,
+                diagnostics=propagation_diagnostics,
             )
-            if direct_trajectory is not None:
-                best_cost = direct_trajectory.cost
-                best_node = direct_index
-                best_trajectory = direct_trajectory
-                if self.config.stop_on_first_solution:
-                    return finish(PlanStatus.SUCCESS, "VALIDATED_GOAL_CONNECTOR", direct_trajectory)
+            propagation_count += used
+            if direct_connection is not None and request.goal_region.contains(direct_connection.end_state):
+                direct_index = len(nodes)
+                nodes.append(
+                    _Node(
+                        direct_connection.end_state,
+                        0,
+                        direct_connection.control,
+                        direct_connection.duration,
+                        direct_connection.rollout,
+                        direct_connection.edge_cost,
+                    )
+                )
+                direct_trajectory = self._trajectory_from_node(
+                    nodes,
+                    direct_index,
+                    request,
+                    map_snapshot,
+                    dynamics,
+                    cost_config,
+                )
+                if direct_trajectory is not None:
+                    best_cost = direct_trajectory.cost
+                    best_node = direct_index
+                    best_trajectory = direct_trajectory
+                    if self.config.stop_on_first_solution:
+                        return finish(PlanStatus.SUCCESS, "VALIDATED_GOAL_CONNECTOR", direct_trajectory)
 
         if best_trajectory is None:
             seed_trajectory = self._grid_seed_trajectory(
@@ -2140,18 +3007,39 @@ class KinodynamicInformedRRTStarPlanner:
                         seed_trajectory,
                     )
 
-        while len(nodes) < self.config.max_nodes and perf_counter() <= deadline:
-            sample, sample_kind = self._sample(
-                rng,
-                request.start_state,
-                goal_state,
-                request.goal_region,
-                map_snapshot,
-                dynamics,
-                best_cost,
-                cost_config,
-            )
+        # Once a validated seed exists, execute at least one optimization
+        # sample even if connector validation consumed the wall-clock budget.
+        # The downstream connectors still receive the original deadline and
+        # therefore cannot perform an unbounded overrun.
+        first_optimization_sample_pending = best_trajectory is not None
+        while len(nodes) < self.config.max_nodes and (
+            first_optimization_sample_pending or perf_counter() <= deadline
+        ):
+            if first_optimization_sample_pending:
+                sample = self._informed_sample(
+                    rng,
+                    request.start_state,
+                    goal_state,
+                    request.goal_region,
+                    map_snapshot,
+                    dynamics,
+                    best_cost,
+                    cost_config,
+                )
+                sample_kind = "informed"
+            else:
+                sample, sample_kind = self._sample(
+                    rng,
+                    request.start_state,
+                    goal_state,
+                    request.goal_region,
+                    map_snapshot,
+                    dynamics,
+                    best_cost,
+                    cost_config,
+                )
             counts[sample_kind] += 1
+            first_optimization_sample_pending = False
             neighbor_indices = self._neighbor_indices(nodes, sample)
             if not neighbor_indices:
                 continue

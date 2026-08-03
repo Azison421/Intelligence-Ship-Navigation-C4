@@ -9,8 +9,10 @@ from usvlib4ros.planning import (
     VesselState,
 )
 from usvlib4ros.policy.safety_supervisor import (
+    CandidateControl,
     CandidateControlGenerator,
     PredictiveSafetySupervisor,
+    minimum_intervention_action,
 )
 
 
@@ -60,6 +62,95 @@ def test_candidate_generator_produces_five_complete_controls():
     )
 
 
+def test_profile_hard_actions_keep_both_full_rudder_endpoints():
+    candidates = CandidateControlGenerator(
+        max_throttle=0.4,
+        max_abs_rudder=0.5,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+    ).generate(0.4, 0.5)
+
+    assert candidates[0].control == Control(0.1, -0.5)
+    assert candidates[2].control == Control(0.4, 0.5)
+    assert candidates[4].control == Control(0.4, 0.5)
+
+
+def test_minimum_intervention_rejects_a_hard_sac_turn_when_soft_is_safe():
+    candidates = tuple(
+        CandidateControl(index, control)
+        for index, control in enumerate(
+            (
+                Control(0.1, -0.5),
+                Control(0.4, -0.2),
+                Control(0.4, 0.0),
+                Control(0.4, 0.2),
+                Control(0.4, 0.5),
+            )
+        )
+    )
+
+    action = minimum_intervention_action(
+        policy_action=4,
+        safe_action_mask=(False, False, False, True, True),
+        candidates=candidates,
+        nominal_control=Control(0.4, 0.0),
+    )
+
+    assert action == 3
+
+
+def test_minimum_intervention_keeps_sac_as_tie_breaker():
+    candidates = tuple(
+        CandidateControl(index, control)
+        for index, control in enumerate(
+            (
+                Control(0.4, -0.4),
+                Control(0.4, -0.2),
+                Control(0.4, 0.0),
+                Control(0.4, 0.2),
+                Control(0.4, 0.4),
+            )
+        )
+    )
+
+    action = minimum_intervention_action(
+        policy_action=3,
+        safe_action_mask=(False, True, False, True, False),
+        candidates=candidates,
+        nominal_control=Control(0.4, 0.0),
+    )
+
+    assert action == 3
+
+
+def test_minimum_intervention_prefers_safe_nominal_over_sac_deviation():
+    candidates = CandidateControlGenerator(
+        max_throttle=0.4,
+        max_abs_rudder=0.5,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+    ).generate(0.4, 0.1)
+
+    action = minimum_intervention_action(
+        policy_action=0,
+        safe_action_mask=(True,) * 5,
+        candidates=candidates,
+        nominal_control=Control(0.4, 0.1),
+    )
+
+    assert action == 2
+
+
 def test_precheck_and_final_arbitration_keep_safe_policy_action():
     world = _world()
     dynamics = PrototypeReducedDynamics()
@@ -86,6 +177,152 @@ def test_precheck_and_final_arbitration_keep_safe_policy_action():
     assert decision.final_action == 2
     assert decision.stop is False
     assert decision.control == candidates[2].control
+
+
+def test_clearance_recovery_only_approves_motion_back_into_strict_safe_area():
+    world = PlanningMapSnapshot.from_rows(
+        ("." * 50,) * 20,
+        snapshot_id="map-clearance-recovery",
+        session_id="session-clearance-recovery",
+        source_version=1,
+        resolution=0.1,
+        footprint_radius=0.0,
+        required_clearance=0.2,
+        stamp_sim=10.0,
+    )
+    state = VesselState(
+        x=0.15,
+        y=1.0,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+        frame_id="map",
+        stamp_sim=10.0,
+    )
+    dynamics = PrototypeReducedDynamics()
+    supervisor = PredictiveSafetySupervisor(prediction_horizon_s=2.0)
+
+    assert not world.is_state_valid(state)
+    assert supervisor.clearance_recovery_is_safe(
+        state,
+        Control(0.1, 0.0),
+        world,
+        dynamics,
+        now_sim=10.0,
+        minimum_clearance_m=0.1,
+    )
+    assert not supervisor.clearance_recovery_is_safe(
+        replace(state, yaw=3.141592653589793),
+        Control(0.1, 0.0),
+        world,
+        dynamics,
+        now_sim=10.0,
+        minimum_clearance_m=0.1,
+    )
+
+
+def test_precheck_retries_one_bounded_horizon_only_after_primary_deadlock(
+    monkeypatch,
+):
+    supervisor = PredictiveSafetySupervisor(prediction_horizon_s=2.0)
+    candidates = CandidateControlGenerator().generate(0.5, 0.0)
+    calls = []
+
+    def fake_precheck(*args, prediction_horizon_s=None, **kwargs):
+        calls.append(prediction_horizon_s)
+        if prediction_horizon_s == 2.0:
+            return (False,) * 5, ("COLLISION",) * 5, (0.0,) * 5
+        return (True,) * 5, ("SAFE",) * 5, (0.4,) * 5
+
+    monkeypatch.setattr(supervisor, "precheck", fake_precheck)
+
+    mask, reasons, clearances, horizon = (
+        supervisor.precheck_with_horizon_fallback(
+            _state(),
+            candidates,
+            _world(),
+            PrototypeReducedDynamics(),
+            now_sim=10.0,
+            primary_horizon_s=2.0,
+            fallback_horizon_s=1.1,
+        )
+    )
+
+    assert calls == [2.0, 1.1]
+    assert mask == (True,) * 5
+    assert reasons == ("SAFE",) * 5
+    assert clearances == (0.4,) * 5
+    assert horizon == 1.1
+
+
+def test_candidate_prefix_then_nominal_future_is_reused_by_final_recheck():
+    world = PlanningMapSnapshot.from_rows(
+        (
+            "..........",
+            "..........",
+            "..........",
+            "....#.....",
+            "..........",
+            "..........",
+        ),
+        snapshot_id="future-controls-map",
+        session_id="future-controls-session",
+        source_version=1,
+        resolution=1.0,
+        required_clearance=0.05,
+    )
+    state = VesselState(
+        x=2.0,
+        y=3.5,
+        yaw=0.0,
+        speed=1.0,
+        yaw_rate=0.0,
+    )
+    candidates = CandidateControlGenerator(
+        max_throttle=1.0,
+        max_abs_rudder=0.1,
+    ).generate(1.0, 0.0)
+    dynamics = PrototypeReducedDynamics()
+    supervisor = PredictiveSafetySupervisor(prediction_horizon_s=2.0)
+
+    constant_mask, _, _ = supervisor.precheck(
+        state,
+        candidates,
+        world,
+        dynamics,
+        now_sim=0.0,
+    )
+    future = ((Control(0.0, 0.0), 1.7),)
+    mask, reasons, clearances = supervisor.precheck(
+        state,
+        candidates,
+        world,
+        dynamics,
+        now_sim=0.0,
+        candidate_prefix_s=0.3,
+        nominal_future_controls=future,
+    )
+    decision = supervisor.finalize(
+        policy_action=2,
+        nominal_action=2,
+        candidate_mask=mask,
+        candidates=candidates,
+        snapshot_id=world.snapshot_id,
+        current_snapshot_id=world.snapshot_id,
+        reasons=reasons,
+        clearances=clearances,
+        current_state=state,
+        current_map_snapshot=world,
+        dynamics=dynamics,
+        now_sim=0.0,
+        candidate_prefix_s=0.3,
+        nominal_future_controls=future,
+    )
+
+    assert not constant_mask[2]
+    assert mask[2]
+    assert not decision.stop
+    assert decision.final_action == 2
 
 
 def test_stale_version_or_empty_safe_set_returns_stop_and_zero_control():

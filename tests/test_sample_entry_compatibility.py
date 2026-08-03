@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 from usvlib4ros.navigation.fixed_map_runtime import RuntimeDecision
 from usvlib4ros.navigation.fixed_map_service import (
+    FAILURE_CONFIRMATION_STEPS,
     FixedMapNavigationService,
+    advance_collision_confirmation,
+    advance_failure_streak,
+    is_collision_evidence,
 )
 from usvlib4ros.planning import Control
 from usvlib4ros.user.nav import DQN_NAV
@@ -39,6 +43,75 @@ class _ActionBridgeCapture:
 
     def set_command(self, throttle, rudder):
         self.command = (throttle, rudder)
+
+
+def test_confirmed_failure_streak_ignores_transient_invalid_samples():
+    streak = 0
+    for _ in range(9):
+        streak = advance_failure_streak(
+            streak,
+            "STATE_INVALID",
+            {"STATE_INVALID", "LASER_EMERGENCY_STOP"},
+        )
+    assert streak == 9
+    assert streak < 10
+
+    assert (
+        advance_failure_streak(
+            streak,
+            "STATE_INVALID",
+            {"STATE_INVALID", "LASER_EMERGENCY_STOP"},
+        )
+        == 10
+    )
+    assert (
+        advance_failure_streak(
+            streak,
+            "POLICY_ACTION_SAFE",
+            {"STATE_INVALID", "LASER_EMERGENCY_STOP"},
+        )
+        == 0
+    )
+    assert not is_collision_evidence("STATE_INVALID", 0.61)
+    assert is_collision_evidence("STATE_INVALID", 0.6)
+    assert not is_collision_evidence("LASER_EMERGENCY_STOP", 0.5)
+    assert not is_collision_evidence("NO_SAFE_ACTION", 0.5)
+
+
+def test_collision_requires_direct_dual_evidence_or_five_seconds_of_laser():
+    assert FAILURE_CONFIRMATION_STEPS == 50
+    streak = 0
+    for _ in range(FAILURE_CONFIRMATION_STEPS - 1):
+        streak, confirmed = advance_collision_confirmation(
+            streak,
+            "LASER_EMERGENCY_STOP",
+            0.5,
+        )
+        assert not confirmed
+
+    streak, confirmed = advance_collision_confirmation(
+        streak,
+        "LASER_EMERGENCY_STOP",
+        0.5,
+    )
+    assert streak == FAILURE_CONFIRMATION_STEPS
+    assert confirmed
+
+    streak, confirmed = advance_collision_confirmation(
+        streak,
+        "NO_SAFE_ACTION",
+        0.5,
+    )
+    assert streak == 0
+    assert not confirmed
+
+    streak, confirmed = advance_collision_confirmation(
+        0,
+        "STATE_INVALID",
+        0.6,
+    )
+    assert streak == 0
+    assert confirmed
 
 
 def test_official_main_entry_remains_byte_identical():

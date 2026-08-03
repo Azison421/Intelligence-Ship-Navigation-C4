@@ -90,6 +90,44 @@ def test_circular_obstacles_are_bound_into_payload_hash():
     assert occupied.payload_content_hash != empty.payload_content_hash
 
 
+def test_oriented_capsule_clearance_changes_with_heading_and_hash():
+    kwargs = {
+        "rows": ("..........",) * 10,
+        "snapshot_id": "capsule-map",
+        "session_id": "capsule-session",
+        "source_version": 1,
+        "resolution": 1.0,
+        "required_clearance": 0.1,
+        "circular_obstacles": (
+            CircularObstacle(x=5.0, y=5.0, radius=0.1),
+        ),
+    }
+    circle = PlanningMapSnapshot.from_rows(
+        footprint_radius=0.4,
+        **kwargs,
+    )
+    capsule = PlanningMapSnapshot.from_rows(
+        footprint_radius=0.0,
+        vessel_capsule_length=1.3,
+        vessel_capsule_width=0.64,
+        geometry_version="official-capsule-v1",
+        **kwargs,
+    )
+    lengthwise = VesselState(
+        x=4.3,
+        y=5.0,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+    )
+    crosswise = replace(lengthwise, yaw=pi / 2.0)
+
+    assert capsule.payload_content_hash != circle.payload_content_hash
+    assert not capsule.is_state_valid(lengthwise)
+    assert capsule.is_state_valid(crosswise)
+    assert capsule.clearance_at(crosswise) > capsule.clearance_at(lengthwise)
+
+
 def _request(dynamics: PrototypeReducedDynamics) -> PlanningRequest:
     return PlanningRequest(
         request_id="request-v1",
@@ -136,6 +174,97 @@ def test_open_water_returns_independently_validated_dynamic_trajectory():
     assert validation.min_clearance >= _world().required_clearance
 
 
+def test_required_visit_regions_are_sampled_in_order_before_terminal_goal():
+    dynamics = PrototypeReducedDynamics()
+    request = _request(dynamics)
+    world = _world()
+    result = KinodynamicInformedRRTStarPlanner(
+        PlannerConfig(max_nodes=500, goal_bias=0.5, stop_on_first_solution=True)
+    ).plan(request, world, dynamics, CostConfig(), now_sim=10.0)
+    assert result.trajectory is not None
+    sampled = result.trajectory.edge_rollouts[0][1]
+    required = GoalRegion(
+        x=sampled.x,
+        y=sampled.y,
+        position_tolerance=1e-6,
+        speed_limit=2.0,
+        yaw_rate_limit=2.0,
+    )
+    visited_request = replace(request, required_visit_regions=(required,))
+    validation = TrajectoryValidator().validate(
+        result.trajectory,
+        visited_request,
+        world,
+        dynamics,
+        CostConfig(),
+    )
+    assert validation.valid
+
+    missed_request = replace(
+        request,
+        required_visit_regions=(
+            GoalRegion(
+                x=1.0,
+                y=7.0,
+                position_tolerance=0.1,
+                speed_limit=2.0,
+                yaw_rate_limit=2.0,
+            ),
+        ),
+    )
+    missed = TrajectoryValidator().validate(
+        result.trajectory,
+        missed_request,
+        world,
+        dynamics,
+        CostConfig(),
+    )
+    assert not missed.valid
+    assert missed.reason == "REQUIRED_VISIT_NOT_MET"
+
+
+def test_required_visit_uses_forward_lattice_seed_then_keeps_rrtstar_budget():
+    dynamics = PrototypeReducedDynamics()
+    request = replace(
+        _request(dynamics),
+        required_visit_regions=(
+            GoalRegion(
+                x=5.0,
+                y=3.0,
+                position_tolerance=0.5,
+                speed_limit=2.0,
+                yaw_rate_limit=2.0,
+            ),
+        ),
+        time_budget_ms=250.0,
+    )
+    controls = (
+        Control(0.3, -0.5),
+        Control(0.3, -0.3),
+        Control(0.3, 0.0),
+        Control(0.3, 0.3),
+        Control(0.3, 0.5),
+    )
+    result = KinodynamicInformedRRTStarPlanner(
+        PlannerConfig(
+            max_nodes=100,
+            stop_on_first_solution=False,
+            forward_action_controls=controls,
+        )
+    ).plan(request, _world(), dynamics, CostConfig(), now_sim=10.0)
+
+    assert result.trajectory is not None
+    assert result.reason != "VALIDATED_FORWARD_LATTICE_SEED"
+    assert sum(result.sample_counts.values()) > 0
+    assert TrajectoryValidator().validate(
+        result.trajectory,
+        request,
+        _world(),
+        dynamics,
+        CostConfig(),
+    ).valid
+
+
 def test_live_calibrated_rudder_needs_headway_and_uses_unity_sign():
     dynamics = PrototypeReducedDynamics()
     rest = VesselState(
@@ -165,6 +294,32 @@ def test_live_calibrated_rudder_needs_headway_and_uses_unity_sign():
     assert stationary[-1].yaw_rate == pytest.approx(0.0)
     assert positive_rudder[-1].yaw_rate < 0.0
     assert negative_rudder[-1].yaw_rate > 0.0
+
+
+def test_reduced_dynamics_can_replay_calibrated_reverse_control():
+    dynamics = PrototypeReducedDynamics(
+        version="reverse-test-v1",
+        allow_reverse=True,
+        max_reverse_speed=0.2,
+        reverse_throttle_speed_gain=0.306,
+    )
+    start = VesselState(
+        x=5.0,
+        y=5.0,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+    )
+
+    rollout = dynamics.propagate(
+        start,
+        Control(throttle=-0.4, rudder=0.0),
+        2.0,
+    )
+
+    assert rollout[-1].speed < -0.05
+    assert rollout[-1].x < start.x
+    assert all(state.is_finite() for state in rollout)
 
 
 def test_official_live_speed_envelope_accepts_reported_transient_speed():

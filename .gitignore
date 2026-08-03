@@ -3,7 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+.codex
 # Project-local training and evaluation outputs.
 artifacts/checkpoints/
 artifacts/logs/

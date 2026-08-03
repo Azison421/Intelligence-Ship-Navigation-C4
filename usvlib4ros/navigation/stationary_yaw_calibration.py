@@ -113,9 +113,15 @@ def evaluate_stationary_yaw(
     )
 
 
-def stationary_yaw_abort_reason(sample: ProbeSafetySample) -> str | None:
+def stationary_yaw_abort_reason(
+    sample: ProbeSafetySample,
+    *,
+    maximum_displacement_m: float = 0.15,
+) -> str | None:
     """Return the first locked safety violation for a live probe sample."""
 
+    if not isfinite(maximum_displacement_m) or maximum_displacement_m <= 0.0:
+        raise ValueError("maximum displacement must be positive and finite")
     if sample.pose_age_s > 0.5:
         return "POSE_STALE"
     if sample.scan_age_s > 1.0:
@@ -124,7 +130,7 @@ def stationary_yaw_abort_reason(sample: ProbeSafetySample) -> str | None:
         return "LASER_EMERGENCY_STOP"
     if sample.clearance_m <= 0.2:
         return "CLEARANCE_VIOLATION"
-    if sample.displacement_m > 0.15:
+    if sample.displacement_m > maximum_displacement_m:
         return "DISPLACEMENT_LIMIT"
     return None
 

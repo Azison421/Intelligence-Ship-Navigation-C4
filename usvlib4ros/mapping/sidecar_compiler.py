@@ -38,7 +38,7 @@ from .coordinates import (
 )
 
 SIDECAR_SCHEMA_VERSION = "build-bound-static-world-sidecar-v1"
-COMPILER_VERSION = "beihu-sidecar-compiler-v2"
+COMPILER_VERSION = "beihu-sidecar-compiler-v3"
 DEFAULT_RESOLUTION_M = 0.2
 DEFAULT_MARGIN_M = 5.0
 DEFAULT_FOOTPRINT_RADIUS_M = 0.4
@@ -57,6 +57,7 @@ class SidecarCompilerConfig:
     margin_m: float = DEFAULT_MARGIN_M
     footprint_radius_m: float = DEFAULT_FOOTPRINT_RADIUS_M
     required_clearance_m: float = DEFAULT_REQUIRED_CLEARANCE_M
+    geometry_version: str = "circle-v1"
     transform_model: str = "axis_affine"
     coverage_status: str = COVERAGE_CANDIDATE
     promotion_note: str = ""
@@ -70,6 +71,8 @@ class SidecarCompilerConfig:
             min(self.resolution_m, self.margin_m) > 0.0
             and self.footprint_radius_m >= 0.0
             and self.required_clearance_m >= 0.0
+            and isinstance(self.geometry_version, str)
+            and bool(self.geometry_version)
             and self.transform_model in TRANSFORM_MODELS
             and fitted_ok
             and self.coverage_status in (COVERAGE_CANDIDATE, COVERAGE_COMPLETE)
@@ -84,6 +87,7 @@ class SidecarCompilerConfig:
                 f"{self.margin_m:.17g}",
                 f"{self.footprint_radius_m:.17g}",
                 f"{self.required_clearance_m:.17g}",
+                f"geometry={self.geometry_version}",
                 f"transform={self.transform_model}",
                 f"coverage={self.coverage_status}",
                 "fitted=" + ",".join(f"{v:.17g}" for v in self.fitted_affine),
@@ -325,6 +329,7 @@ def compile_beihu_sidecar(
             )
             for buoy in buoys
         ),
+        geometry_version=config.geometry_version,
     )
     snapshot.precompute_clearance()
     manifest = SidecarMapManifest(

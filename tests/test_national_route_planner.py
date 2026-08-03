@@ -6,8 +6,11 @@ for route version 46.  It contains no host, device id, or GPS coordinates.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
+
+import pytest
 
 from usvlib4ros.mapping import (
     SidecarCompilerConfig,
@@ -15,6 +18,7 @@ from usvlib4ros.mapping import (
     load_sidecar_artifact,
 )
 from usvlib4ros.planning import (
+    Control,
     CostConfig,
     GoalRegion,
     KinodynamicInformedRRTStarPlanner,
@@ -24,13 +28,25 @@ from usvlib4ros.planning import (
     VesselState,
 )
 from usvlib4ros.planning.fixed_route import (
+    NARROW_ESCAPE_RELEASE_X_M,
+    NARROW_ESCAPE_XY,
+    NARROW_ROUTE_INDEX,
+    NarrowCompositeInfeasibleError,
+    build_fixed_leg_request,
     compile_offline_national_map,
     fixed_route_goal_xy,
+    fixed_route_geometry_candidates,
+    narrow_escape_released,
     fixed_route_planning_gate,
     fixed_route_tolerance,
     fixed_route_waypoint_reached,
     plan_fixed_leg,
-    plan_fixed_route,
+    plan_narrow_with_geometry_evidence,
+)
+from usvlib4ros.planning.forward_control_profile import (
+    ForwardControlProfile,
+    diagnostic_forward_control_profile,
+    reduced_dynamics_from_profile,
 )
 
 
@@ -50,6 +66,47 @@ LIVE_ROUTE_AFFINE = (
     -191.1658098488378,
     -299.80159718108752,
 )
+
+
+def test_live_non_collision_recovery_pose_keeps_point_two_planning_margin():
+    compiled = compile_offline_national_map(
+        session_id="live-point-one-margin-evidence",
+    )
+    recovery = VesselState(
+        x=38.57,
+        y=73.66,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+    )
+    clearance = compiled.snapshot.clearance_at(recovery)
+
+    assert 0.1 < clearance < 0.2
+    assert compiled.snapshot.required_clearance == 0.2
+    assert compiled.snapshot.geometry_version == (
+        "circle-0.4-margin-0.2-live-recovery-v1"
+    )
+    assert not compiled.snapshot.is_state_valid(recovery)
+
+
+def test_narrow_escape_releases_after_crossing_the_safe_east_plane():
+    compiled = compile_offline_national_map(
+        session_id="narrow-safe-release-plane",
+    )
+    released = VesselState(
+        x=NARROW_ESCAPE_RELEASE_X_M,
+        y=99.25,
+        yaw=3.0,
+        speed=-0.12,
+        yaw_rate=0.0,
+    )
+    not_released = replace(
+        released,
+        x=NARROW_ESCAPE_RELEASE_X_M - 0.01,
+    )
+
+    assert narrow_escape_released(compiled, released)
+    assert not narrow_escape_released(compiled, not_released)
 
 
 def _compiled_live_route():
@@ -82,6 +139,26 @@ def _route_planner():
             max_request_age_s=60.0,
             max_map_age_s=1.0e9,
         )
+    )
+
+
+def _formal_profile_shape() -> ForwardControlProfile:
+    """Deterministic unit fixture matching the approved live profile shape."""
+
+    return ForwardControlProfile(
+        calibration_hash="0" * 64,
+        minimum_steerage_throttle=0.1,
+        cruise_throttle=0.4,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+        throttle_speed_gain=1.2681317113395243,
+        positive_rudder_yaw_rate_gain=1.962635624471142,
+        negative_rudder_yaw_rate_gain=2.048615259634089,
     )
 
 
@@ -151,6 +228,293 @@ def test_waypoint_reach_requires_ship_centre_within_point_five_metres():
     )
 
 
+def test_narrow_point_is_one_visit_then_east_escape_planning_request():
+    compiled = compile_offline_national_map(
+        session_id="national-route-narrow-composite",
+    )
+    dynamics = PrototypeReducedDynamics()
+    previous = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX - 1,
+    )
+    original = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX,
+    )
+    next_goal = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX + 1,
+    )
+    start = VesselState(
+        x=previous[0],
+        y=previous[1],
+        yaw=math.atan2(original[1] - previous[1], original[0] - previous[0]),
+        speed=0.3,
+        yaw_rate=0.0,
+    )
+    request = build_fixed_leg_request(
+        compiled,
+        start_state=start,
+        mission_index=NARROW_ROUTE_INDEX,
+        dynamics=dynamics,
+        cost_config=CostConfig(),
+        time_budget_ms=5_000.0,
+        seed=31,
+        lookahead_count=0,
+    )
+
+    assert (request.goal_region.x, request.goal_region.y) == NARROW_ESCAPE_XY
+    assert len(request.required_visit_regions) == 2
+    assert (
+        request.required_visit_regions[1].x,
+        request.required_visit_regions[1].y,
+        request.required_visit_regions[1].position_tolerance,
+    ) == (*original, 0.5)
+    direct = compiled.snapshot.check_motion(
+        (
+            VesselState(
+                x=request.required_visit_regions[0].x,
+                y=request.required_visit_regions[0].y,
+                yaw=0.0,
+                speed=0.3,
+                yaw_rate=0.0,
+            ),
+            VesselState(
+                x=next_goal[0],
+                y=next_goal[1],
+                yaw=0.0,
+                speed=0.3,
+                yaw_rate=0.0,
+            ),
+        )
+    )
+    assert not direct.valid
+
+
+def test_escape_replan_does_not_require_revisiting_completed_narrow_point():
+    compiled = compile_offline_national_map(
+        session_id="national-route-escape-replan",
+    )
+    dynamics = PrototypeReducedDynamics()
+    original = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX,
+    )
+    request = build_fixed_leg_request(
+        compiled,
+        start_state=VesselState(
+            x=original[0],
+            y=original[1],
+            yaw=0.0,
+            speed=0.3,
+            yaw_rate=0.0,
+        ),
+        mission_index=NARROW_ROUTE_INDEX,
+        dynamics=dynamics,
+        cost_config=CostConfig(),
+        time_budget_ms=5_000.0,
+        seed=31,
+        lookahead_count=0,
+        narrow_visit_completed=True,
+    )
+
+    assert (request.goal_region.x, request.goal_region.y) == NARROW_ESCAPE_XY
+    assert request.required_visit_regions == ()
+
+
+def test_geometry_evidence_gate_is_circle_then_capsule_then_point_one_margin():
+    compiled = compile_offline_national_map(
+        session_id="national-route-geometry-gate",
+    )
+
+    candidates = fixed_route_geometry_candidates(compiled)
+
+    assert tuple(
+        candidate.snapshot.geometry_version for candidate in candidates
+    ) == (
+        "circle-0.4-margin-0.2-v1",
+        "official-capsule-1.3x0.64-margin-0.2-v1",
+        "official-capsule-1.3x0.64-margin-0.1-v1",
+    )
+    assert tuple(
+        candidate.snapshot.required_clearance for candidate in candidates
+    ) == (0.2, 0.2, 0.1)
+    assert len(
+        {candidate.snapshot.payload_content_hash for candidate in candidates}
+    ) == 3
+
+
+def test_narrow_composite_fails_closed_after_all_approved_geometry_gates():
+    compiled = compile_offline_national_map(
+        session_id="national-route-narrow-trajectory",
+    )
+    previous = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX - 1,
+    )
+    gate = fixed_route_planning_gate(compiled, NARROW_ROUTE_INDEX)
+    start = VesselState(
+        x=previous[0],
+        y=previous[1],
+        yaw=math.atan2(gate[1] - previous[1], gate[0] - previous[0]),
+        speed=0.3,
+        yaw_rate=0.0,
+    )
+
+    with pytest.raises(NarrowCompositeInfeasibleError) as captured:
+        plan_narrow_with_geometry_evidence(
+            compiled,
+            start_state=start,
+            time_budget_ms=400.0,
+            seed=71,
+            forward_action_controls=(
+                diagnostic_forward_control_profile().action_controls
+            ),
+        )
+
+    evidence = captured.value.evidence
+    assert len(evidence) == 3
+    assert not any(item.feasible for item in evidence)
+    assert tuple(item.geometry_version for item in evidence) == (
+        "circle-0.4-margin-0.2-v1",
+        "official-capsule-1.3x0.64-margin-0.2-v1",
+        "official-capsule-1.3x0.64-margin-0.1-v1",
+    )
+
+
+def test_narrow_composite_can_reverse_through_its_single_entry():
+    compiled = compile_offline_national_map(
+        session_id="national-route-reverse-escape",
+    )
+    profile = _formal_profile_shape()
+    base_dynamics = reduced_dynamics_from_profile(profile)
+    dynamics = replace(
+        base_dynamics,
+        version=f"{base_dynamics.version}-reverse-v1",
+        allow_reverse=True,
+        max_reverse_speed=0.2,
+        reverse_throttle_speed_gain=0.306,
+    )
+    previous = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX - 1,
+    )
+    gate = fixed_route_planning_gate(compiled, NARROW_ROUTE_INDEX)
+    start = VesselState(
+        x=previous[0],
+        y=previous[1],
+        yaw=math.atan2(gate[1] - previous[1], gate[0] - previous[0]),
+        speed=0.3,
+        yaw_rate=0.0,
+    )
+    reverse = Control(-0.4, 0.0)
+
+    trajectory = plan_fixed_leg(
+        compiled,
+        start_state=start,
+        mission_index=NARROW_ROUTE_INDEX,
+        dynamics=dynamics,
+        forward_action_controls=(*profile.action_controls, reverse),
+        time_budget_ms=5_000.0,
+        seed=71,
+        _allow_retry=False,
+    )
+
+    original = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX,
+    )
+    assert reverse in trajectory.controls
+    assert any(
+        math.hypot(state.x - original[0], state.y - original[1]) <= 0.5
+        for rollout in trajectory.edge_rollouts
+        for state in rollout
+    )
+    assert math.hypot(
+        trajectory.states[-1].x - NARROW_ESCAPE_XY[0],
+        trajectory.states[-1].y - NARROW_ESCAPE_XY[1],
+    ) <= 0.3
+
+
+@pytest.mark.parametrize(
+    "entry_state",
+    (
+        (
+            32.95171342055915,
+            99.26520585035696,
+            2.819942972022514,
+            0.44881696654570113,
+            0.6233649894781259,
+            0.1,
+            -0.4508191167693636,
+        ),
+        (
+            32.92501609984386,
+            99.23545963004646,
+            2.896899542842471,
+            0.5072523199396324,
+            0.34187009513995664,
+            0.4,
+            -0.2,
+        ),
+    ),
+)
+def test_narrow_composite_recovers_a_safe_high_yaw_rate_entry_state(
+    entry_state,
+):
+    compiled = compile_offline_national_map(
+        session_id="national-route-reverse-entry-recovery",
+    )
+    profile = _formal_profile_shape()
+    base_dynamics = reduced_dynamics_from_profile(profile)
+    dynamics = replace(
+        base_dynamics,
+        version=f"{base_dynamics.version}-reverse-v1",
+        allow_reverse=True,
+        max_reverse_speed=0.2,
+        reverse_throttle_speed_gain=0.306,
+    )
+    start = VesselState(
+        x=entry_state[0],
+        y=entry_state[1],
+        yaw=entry_state[2],
+        speed=entry_state[3],
+        yaw_rate=entry_state[4],
+        throttle_state=entry_state[5],
+        rudder_state=entry_state[6],
+    )
+    reverse = Control(-0.4, 0.0)
+
+    trajectory = plan_fixed_leg(
+        compiled,
+        start_state=start,
+        mission_index=NARROW_ROUTE_INDEX,
+        dynamics=dynamics,
+        forward_action_controls=(*profile.action_controls, reverse),
+        time_budget_ms=5_000.0,
+        seed=100,
+        _allow_retry=False,
+    )
+
+    original = fixed_route_goal_xy(
+        compiled.manifest,
+        NARROW_ROUTE_INDEX,
+    )
+    assert compiled.snapshot.check_motion(
+        trajectory.edge_rollouts[0]
+    ).valid
+    assert any(
+        math.hypot(state.x - original[0], state.y - original[1]) <= 0.5
+        for rollout in trajectory.edge_rollouts
+        for state in rollout
+    )
+    assert reverse in trajectory.controls
+    assert math.hypot(
+        trajectory.states[-1].x - NARROW_ESCAPE_XY[0],
+        trajectory.states[-1].y - NARROW_ESCAPE_XY[1],
+    ) <= 0.3
+
+
 def test_planner_solves_first_buoy_gate_with_kinodynamic_seed():
     """The first fixed leg needs a bend around a buoy, not a straight edge."""
 
@@ -211,33 +575,92 @@ def test_planner_solves_first_buoy_gate_with_kinodynamic_seed():
     assert result.trajectory.min_clearance > snapshot.required_clearance
 
 
-def test_planner_chains_all_fixed_route_waypoints():
-    """Use each certified terminal state as the next leg's live start state."""
+def test_fixed_leg_uses_only_calibrated_forward_motion_primitives():
+    compiled = compile_offline_national_map(
+        session_id="national-route-profile-controls",
+    )
+    profile = _formal_profile_shape()
+    dynamics = reduced_dynamics_from_profile(profile)
+    start_xy = fixed_route_goal_xy(compiled.manifest, 0)
+    goal_xy = fixed_route_goal_xy(compiled.manifest, 1)
+    start = VesselState(
+        x=start_xy[0],
+        y=start_xy[1],
+        yaw=math.atan2(
+            goal_xy[1] - start_xy[1],
+            goal_xy[0] - start_xy[0],
+        ),
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
+    )
+
+    trajectory = plan_fixed_leg(
+        compiled,
+        start_state=start,
+        mission_index=1,
+        dynamics=dynamics,
+        forward_action_controls=profile.action_controls,
+        time_budget_ms=5_000.0,
+        optimize_with_rrtstar=False,
+    )
+
+    assert trajectory.controls
+    assert set(trajectory.controls) <= set(profile.action_controls)
+    assert trajectory.times[-1] <= 300.0
+
+
+def test_planner_chains_ordinary_legs_until_narrow_geometry_gate():
+    """Ordinary legs must use calibrated primitives before the known blocker."""
 
     compiled = compile_offline_national_map(
         session_id="national-route-chain",
     )
-    route_plan = plan_fixed_route(
-        compiled,
-        optimize_with_rrtstar=False,
+    profile = _formal_profile_shape()
+    dynamics = reduced_dynamics_from_profile(profile)
+    start_xy = fixed_route_goal_xy(compiled.manifest, 0)
+    goal_xy = fixed_route_goal_xy(compiled.manifest, 1)
+    state = VesselState(
+        x=start_xy[0],
+        y=start_xy[1],
+        yaw=math.atan2(
+            goal_xy[1] - start_xy[1],
+            goal_xy[0] - start_xy[0],
+        ),
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
     )
+    trajectories = []
+    for mission_index in range(1, NARROW_ROUTE_INDEX):
+        trajectory = plan_fixed_leg(
+            compiled,
+            start_state=state,
+            mission_index=mission_index,
+            dynamics=dynamics,
+            forward_action_controls=profile.action_controls,
+            time_budget_ms=5_000.0,
+            optimize_with_rrtstar=False,
+        )
+        trajectories.append(trajectory)
+        state = trajectory.states[-1]
 
-    assert len(route_plan.trajectories) == 12
+    assert len(trajectories) == NARROW_ROUTE_INDEX - 1
     assert all(
         trajectory.validation_status == "VALID"
-        for trajectory in route_plan.trajectories
+        for trajectory in trajectories
     )
     assert all(
         trajectory.min_clearance
-        > route_plan.compiled_map.snapshot.required_clearance
-        for trajectory in route_plan.trajectories
+        > compiled.snapshot.required_clearance
+        for trajectory in trajectories
     )
     assert all(
-        control.throttle <= 0.1 + 1e-9
-        and abs(control.rudder) <= 0.1 + 1e-9
-        for trajectory in route_plan.trajectories
+        control in profile.action_controls
+        for trajectory in trajectories
         for control in trajectory.controls
     )
+    assert sum(trajectory.times[-1] for trajectory in trajectories) < 300.0
 
 
 def test_fixed_leg_recovers_after_safe_policy_exploration():
@@ -254,12 +677,15 @@ def test_fixed_leg_recovers_after_safe_policy_exploration():
         rudder_state=0.0,
         stamp_sim=76.8,
     )
+    profile = _formal_profile_shape()
 
     trajectory = plan_fixed_leg(
         compiled,
         start_state=off_path_state,
         mission_index=11,
-        time_budget_ms=2_000.0,
+        dynamics=reduced_dynamics_from_profile(profile),
+        forward_action_controls=profile.action_controls,
+        time_budget_ms=5_000.0,
         seed=809,
     )
 

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from usvlib4ros.msg.global_data import GlobalData
 from usvlib4ros.navigation.device_action_bridge import (
@@ -26,10 +31,27 @@ from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros.usvRosUtil import USVRosbridgeClient
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "logs"
 PERIOD_S = 0.1
-RUDDER_PERCENT = 10
+
+
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rudder-percent", type=int, default=10)
+    parser.add_argument(
+        "--maximum-displacement-m",
+        type=float,
+        default=0.15,
+    )
+    args = parser.parse_args()
+    if not 1 <= args.rudder_percent <= 100:
+        parser.error("--rudder-percent must be in [1, 100]")
+    if (
+        not math.isfinite(args.maximum_displacement_m)
+        or args.maximum_displacement_m <= 0.0
+    ):
+        parser.error("--maximum-displacement-m must be positive")
+    return args
 
 
 def _minimum_valid_laser(sample) -> float:
@@ -79,11 +101,13 @@ def _phase_summary(
 
 
 def main() -> int:
+    args = _arguments()
     started_at = time.strftime("%Y%m%d-%H%M%S")
     output = OUTPUT_DIR / f"stationary-yaw-{started_at}.json"
     result: dict[str, object] = {
         "schema_version": "national-test-stationary-yaw-v1",
-        "rudder_percent": RUDDER_PERCENT,
+        "rudder_percent": args.rudder_percent,
+        "maximum_displacement_m": args.maximum_displacement_m,
         "zero_throttle_only": True,
         "contains_sensitive_connection_data": False,
         "verdict": "aborted",
@@ -217,7 +241,10 @@ def main() -> int:
                         "scan_age_s": runtime_input.scan_age_s,
                     }
                 )
-                reason = stationary_yaw_abort_reason(safety_sample)
+                reason = stationary_yaw_abort_reason(
+                    safety_sample,
+                    maximum_displacement_m=args.maximum_displacement_m,
+                )
                 if reason is not None:
                     raise RuntimeError(f"{reason}:{name}")
                 samples.append((state, runtime_input))
@@ -228,9 +255,17 @@ def main() -> int:
 
         phases = {}
         baseline_samples = phase("baseline", 2.0, 0)
-        positive_samples = phase("positive", 1.0, RUDDER_PERCENT)
+        positive_samples = phase(
+            "positive",
+            1.0,
+            args.rudder_percent,
+        )
         phase("positive_settle", 2.0, 0)
-        negative_samples = phase("negative", 1.0, -RUDDER_PERCENT)
+        negative_samples = phase(
+            "negative",
+            1.0,
+            -args.rudder_percent,
+        )
         phase("negative_settle", 2.0, 0)
 
         baseline, phases["baseline"] = _phase_summary(
@@ -252,6 +287,7 @@ def main() -> int:
             baseline=baseline,
             positive=positive,
             negative=negative,
+            maximum_displacement_m=args.maximum_displacement_m,
         )
         result.update(
             {

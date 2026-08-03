@@ -474,7 +474,7 @@ class _RecurrentHead(nn.Module):
 class RecurrentDiscreteSAC:
     """Twin-Q discrete SAC with GRU history and exact masked expectations."""
 
-    action_schema = "five-discrete-rudder-v1"
+    action_schema = "five-discrete-forward-bias-v2"
 
     def __init__(
         self,

@@ -60,3 +60,22 @@ def test_probe_aborts_on_each_locked_safety_limit():
         assert stationary_yaw_abort_reason(sample) == expected
 
     assert stationary_yaw_abort_reason(ProbeSafetySample(**safe)) is None
+
+
+def test_probe_displacement_limit_can_be_relaxed_for_open_water_diagnostics():
+    sample = ProbeSafetySample(
+        pose_age_s=0.1,
+        scan_age_s=0.1,
+        clearance_m=3.0,
+        minimum_laser_m=3.0,
+        displacement_m=0.5,
+    )
+
+    assert stationary_yaw_abort_reason(sample) == "DISPLACEMENT_LIMIT"
+    assert (
+        stationary_yaw_abort_reason(
+            sample,
+            maximum_displacement_m=1.5,
+        )
+        is None
+    )
